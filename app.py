@@ -365,11 +365,10 @@ else:
 import pandas as pd
 import streamlit as st
 
-# Define FIRST (so it exists when the script reruns)
+# --- DEFINE FIRST ---
 def run_engineering(deduped_df: pd.DataFrame) -> pd.DataFrame:
     st.markdown("---")
     st.header("Step 2 — Feature Engineering from ERP Lists (Exact Parity)")
-
     df = deduped_df.copy()
 
     # ---------- Helpers ----------
@@ -407,78 +406,69 @@ def run_engineering(deduped_df: pd.DataFrame) -> pd.DataFrame:
         .str.replace("lebanon", "lebanese", regex=False)
     )
 
-    # Trait counts (display only)
+    # Displays
     client_mts_table = get_all_trait_counts_standardized(df, "client_mts_at_hiring")
     maid_mts_table   = get_all_trait_counts_standardized(df, "maid_mts_at_hiring")
     maid_pref_table  = get_all_trait_counts_standardized(df, "maids_custom_preferences_at_hiring")
-
     with st.expander("All Traits (Raw → Canonical Tokens)"):
-        st.subheader("Client MTS (at hiring)")
-        st.dataframe(client_mts_table, use_container_width=True)
-        st.subheader("Maid MTS (at hiring)")
-        st.dataframe(maid_mts_table, use_container_width=True)
-        st.subheader("Maid Custom Preferences (at hiring)")
-        st.dataframe(maid_pref_table, use_container_width=True)
+        st.subheader("Client MTS (at hiring)"); st.dataframe(client_mts_table, use_container_width=True)
+        st.subheader("Maid MTS (at hiring)");   st.dataframe(maid_mts_table,   use_container_width=True)
+        st.subheader("Maid Custom Prefs");      st.dataframe(maid_pref_table,  use_container_width=True)
 
-    # Safe fill before tokenizing
+    # Fill + tokenize
     df["client_mts_at_hiring"] = df["client_mts_at_hiring"].fillna("no_preference")
-    df["maid_mts_at_hiring"] = df["maid_mts_at_hiring"].fillna("no_preference")
+    df["maid_mts_at_hiring"]   = df["maid_mts_at_hiring"].fillna("no_preference")
     df["maids_custom_preferences_at_hiring"] = df["maids_custom_preferences_at_hiring"].fillna("no_preference")
 
-    # Tokenize (client fix ON; maid & prefs as-is)
     client_mts_raw = _standardize_series_to_trait_lists(df["client_mts_at_hiring"], do_lebanon_fix=True)
     maid_mts_raw   = _standardize_series_to_trait_lists(df["maid_mts_at_hiring"])
     maid_pref_raw  = _standardize_series_to_trait_lists(df["maids_custom_preferences_at_hiring"])
 
-    # ---------- Client feature extractors ----------
+    # ---------- Client features ----------
     def client_get_household_type(traits):
         baby = "has a baby younger than 2 years old" in traits
         kids = "has 3 kids or more" in traits
         no_kids = "i prefer working with a family with no kids" in traits
         if baby and kids: return "baby_and_kids"
-        if baby:          return "baby"
-        if kids:          return "many_kids"
-        if no_kids:       return "no_kids"
+        if baby: return "baby"
+        if kids: return "many_kids"
+        if no_kids: return "no_kids"
         return "none"
 
     def client_get_special_case(traits):
         elderly = "elderly parent at home" in traits
         special = "special needs kid" in traits
         if elderly and special: return "elderly_and_special"
-        if elderly:             return "elderly"
-        if special:             return "special_needs"
+        if elderly: return "elderly"
+        if special: return "special_needs"
         return "none"
 
     def client_get_pet_type(traits):
         cat = "has a cat" in traits
         dog = "has a dog" in traits
         if cat and dog: return "both"
-        if cat:         return "cat"
-        if dog:         return "dog"
+        if cat: return "cat"
+        if dog: return "dog"
         return "none"
 
     def client_get_dayoff_policy(traits):
         policies = []
-        if "give day off other than sunday negation" in traits:
-            policies.append("flexible")
-        if "work on her day off for pay" in traits:
-            policies.append("work_for_pay")
-        if "stay home on day off" in traits or "take her day off at home for pay" in traits:
-            policies.append("stay_home_for_pay")
+        if "give day off other than sunday negation" in traits: policies.append("flexible")
+        if "work on her day off for pay" in traits: policies.append("work_for_pay")
+        if "stay home on day off" in traits or "take her day off at home for pay" in traits: policies.append("stay_home_for_pay")
         return "+".join(policies) if policies else "none"
 
     def client_get_nationality_preference(traits):
         preferred = []
         for nationality in ["filipina", "west african nationality", "ethiopian maid", "indian"]:
-            if nationality in traits:
-                preferred.append(nationality)
+            if nationality in traits: preferred.append(nationality)
         return "+".join(preferred) if preferred else "any"
 
     def client_get_living_arrangement(traits):
         arrangement = []
-        if "live out" in traits:            arrangement.append("live_out")
-        if "has a private room" in traits:  arrangement.append("private_room")
-        if "lives in abu dhabi" in traits:  arrangement.append("abu_dhabi")
+        if "live out" in traits: arrangement.append("live_out")
+        if "has a private room" in traits: arrangement.append("private_room")
+        if "lives in abu dhabi" in traits: arrangement.append("abu_dhabi")
         return "+".join(arrangement) if arrangement else "unspecified"
 
     def client_get_cuisine_preference(traits):
@@ -498,30 +488,26 @@ def run_engineering(deduped_df: pd.DataFrame) -> pd.DataFrame:
         baby = "has a baby younger than 2 years old" in traits
         kids = "has 3 kids or more" in traits
         if baby and kids: return "baby_and_kids"
-        if baby:          return "baby"
-        if kids:          return "many_kids"
+        if baby: return "baby"
+        if kids: return "many_kids"
         return "none"
 
     def maid_get_pet_type(traits):
         cat = "has a cat" in traits
         dog = "has a dog" in traits
         if cat and dog: return "both"
-        if cat:         return "cat"
-        if dog:         return "dog"
+        if cat: return "cat"
+        if dog: return "dog"
         return "none"
 
     def maid_get_dayoff_policy(traits):
-        if "give day off other than sunday negation" in traits:
-            return "flexible"
+        if "give day off other than sunday negation" in traits: return "flexible"
         return "unspecified"
 
     def maid_get_living_arrangement(traits):
-        if "has a private room" in traits and "lives in abu dhabi" in traits:
-            return "private_room+avoids_abu_dhabi"
-        if "has a private room" in traits:
-            return "private_room"
-        if "lives in abu dhabi" in traits:
-            return "avoids_abu_dhabi"
+        if "has a private room" in traits and "lives in abu dhabi" in traits: return "private_room+avoids_abu_dhabi"
+        if "has a private room" in traits: return "private_room"
+        if "lives in abu dhabi" in traits: return "avoids_abu_dhabi"
         return "unspecified"
 
     df["maidmts_household_type"]     = maid_mts_raw.apply(maid_get_household_type)
@@ -534,8 +520,8 @@ def run_engineering(deduped_df: pd.DataFrame) -> pd.DataFrame:
         has_university = "has university degree" in traits
         has_school     = "has a school degree" in traits
         if has_university and has_school: return "both"
-        if has_university:                return "university"
-        if has_school:                    return "school"
+        if has_university: return "university"
+        if has_school: return "school"
         return "not_specified"
 
     def maidpref_get_kids_experience(traits):
@@ -543,16 +529,16 @@ def run_engineering(deduped_df: pd.DataFrame) -> pd.DataFrame:
                  or "maid has experience with kids between 6 months and 2 years" in traits)
         above2 = "maid has experience with kids above 2 years old" in traits
         if less2 and above2: return "both"
-        if less2:            return "lessthan2"
-        if above2:           return "above2"
+        if less2: return "lessthan2"
+        if above2: return "above2"
         return "none"
 
     def maidpref_get_pet_handling(traits):
         cats = "handles multiple cats" in traits
         dogs = "handles multiple dogs" in traits
         if cats and dogs: return "both"
-        if cats:          return "cats"
-        if dogs:          return "dogs"
+        if cats: return "cats"
+        if dogs: return "dogs"
         return "none"
 
     def maidpref_get_personality(traits):
@@ -569,8 +555,8 @@ def run_engineering(deduped_df: pd.DataFrame) -> pd.DataFrame:
         travel   = "maid does not mind travelling" in traits
         relocate = "don’t mind relocating" in traits or "don't mind relocating" in traits
         if travel and relocate: return "travel_and_relocate"
-        if travel:              return "travel"
-        if relocate:            return "relocate"
+        if travel: return "travel"
+        if relocate: return "relocate"
         return "no"
 
     def maidpref_get_smoking(traits):
@@ -596,13 +582,10 @@ def run_engineering(deduped_df: pd.DataFrame) -> pd.DataFrame:
     # ---------- Preview + Download ----------
     st.subheader("Engineered Columns (preview)")
     engineered_cols = [
-        # client
         "clientmts_household_type","clientmts_special_cases","clientmts_pet_type",
         "clientmts_dayoff_policy","clientmts_nationality_preference",
         "clientmts_living_arrangement","clientmts_cuisine_preference",
-        # maid
         "maidmts_household_type","maidmts_pet_type","maidmts_dayoff_policy","maidmts_living_arrangement",
-        # maid preferences
         "maidpref_education","maidpref_kids_experience","maidpref_pet_handling",
         "maidpref_personality","maidpref_travel","maidpref_smoking","maidpref_caregiving_profile",
     ]
@@ -618,23 +601,22 @@ def run_engineering(deduped_df: pd.DataFrame) -> pd.DataFrame:
         file_name="engineered_features.csv",
         mime="text/csv",
     )
-
     return df
 
-# --------- UI to trigger engineering (after the function is defined) ---------
-# Show a preview if we have deduped data in session
-if st.session_state.deduped_df is not None:
+# --------- Trigger UI (safe .get() usage) ---------
+deduped_df_ss = st.session_state.get("deduped_df")
+
+if deduped_df_ss is not None:
     st.markdown("### Deduped preview (from session)")
-    st.dataframe(st.session_state.deduped_df.head(10), use_container_width=True)
+    st.dataframe(deduped_df_ss.head(10), use_container_width=True)
 else:
     st.info("Run Cleaning & Preprocessing first to enable feature engineering.")
 
-# Button is disabled if there is no deduped data yet
-if st.button("🧩 Run Feature Engineering (ERP Lists)", disabled=st.session_state.deduped_df is None):
-    engineered_df = run_engineering(st.session_state.deduped_df)
-    st.session_state.engineered_df = engineered_df
+if st.button("🧩 Run Feature Engineering (ERP Lists)", disabled=deduped_df_ss is None):
+    engineered_df = run_engineering(deduped_df_ss)
+    st.session_state["engineered_df"] = engineered_df
 
-# Optional: show engineered preview if available
-if st.session_state.engineered_df is not None:
+engineered_df_ss = st.session_state.get("engineered_df")
+if engineered_df_ss is not None:
     st.markdown("### Engineered preview (from session)")
-    st.dataframe(st.session_state.engineered_df.head(10), use_container_width=True)
+    st.dataframe(engineered_df_ss.head(10), use_container_width=True)
