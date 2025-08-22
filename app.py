@@ -1479,7 +1479,7 @@ def _render_rows(df_subset, section_title, system_prompt: str):
     themed_rows = []
     for k, (_, row) in enumerate(df_subset.iterrows(), start=1):
         res = extract_themes_cached(system_prompt.strip(), str(row["complaint_summary"]))
-            themed_rows.append({
+        themed_rows.append({
             "client_name": row.get("client_name"),
             "maid_id":     row.get("maid_id"),
             "tag_date":    row.get("tag_date"),
