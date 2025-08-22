@@ -8,6 +8,10 @@ from statistics import mode, StatisticsError
 import numpy as np
 import pandas as pd
 import streamlit as st
+# ---- Keep data across button clicks ----
+for k in ("cleaned_df", "deduped_df", "engineered_df"):
+    st.session_state.setdefault(k, None)
+
 
 st.set_page_config(page_title="Cleaning & Preprocessing — Capstone", layout="wide")
 
@@ -286,6 +290,11 @@ if uploaded:
             before_rows = df.shape[0]
             deduped_df = deduplicate(df)
             after_rows = deduped_df.shape[0]
+
+            # SAVE TO SESSION *HERE* (deduped_df is still in scope)
+            st.session_state["cleaned_df"] = df.copy()
+            st.session_state["deduped_df"] = deduped_df.copy()
+            st.success("Cleaning completed and saved to session.")
 
         st.success("Cleaning completed.")
 
@@ -586,7 +595,8 @@ def run_engineering(deduped_df: pd.DataFrame) -> pd.DataFrame:
         file_name="engineered_features.csv",
         mime="text/csv",
     )
-    return df
+    return df  
+    st.success("Cleaning completed and saved to session.")
 
 # --------- Trigger UI (uses session; button enabled only when data exists) ---------
 deduped_df_ss = st.session_state.get("deduped_df")
