@@ -1351,7 +1351,13 @@ import json
 import time
 import pandas as pd
 import streamlit as st
-import google.generativeai as genai
+# ---- Safe Gemini import (only for the Gemini sections) ----
+try:
+    import google.generativeai as genai
+    HAS_GENAI = True
+except Exception:
+    genai = None
+    HAS_GENAI = False
 
 st.title("Complaint Themes Extractor")
 st.caption("Step 1: Skeleton app — we’ll add upload & extraction next.")
