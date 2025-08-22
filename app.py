@@ -1885,7 +1885,7 @@ import math
 import numpy as np
 import pandas as pd
 import streamlit as st
-import re  # <-- added
+import re  # <-- NEW
 
 st.markdown("---")
 st.header("Auto-Assignment (Themes ✕ Matching Score)")
@@ -1921,7 +1921,7 @@ with c1:
 with c2:
     maid_json_file = st.file_uploader("Maid themes JSON", type=["json"], key="maid_themes_json_up")
 
-# ---- NEW: canonicalize theme tokens so overlaps collide reliably ----
+# === NEW: canonicalize theme tokens so overlaps collide reliably ===
 def _norm_theme(s) -> str:
     """Normalize theme tokens (lowercase, non-alnum -> underscore, trim)."""
     return re.sub(r"[^a-z0-9]+", "_", str(s).lower()).strip("_")
@@ -1930,31 +1930,21 @@ def _load_theme_map(file, entity_key: str) -> dict[str, dict[str, int]]:
     """
     Robustly load your themes JSON and return:
         { <entity_id>: { <theme>: frequency, ... }, ... }
-
-    Accepts shapes:
-      1) { "<id>": [ {all_case_themes:[], subcategory_themes:[]}, ... ], ... }
-      2) { "clients" | "maids" | "entities": [...] }  (unwraps)
-      3) [ {client_name/maid_id: "...", all_case_themes:[], subcategory_themes:[]}, ... ]
-      4) rows using keys 'themes'/'subcats'/'subcategories' instead of 'all_case_themes'/'subcategory_themes'
+    (accepts several shapes; unchanged logic, now normalizes tokens)
     """
     if not file:
         return {}
 
-    import json
     file.seek(0)
     raw = json.loads(file.read().decode("utf-8"))
 
-    # ---- unify into a mapping: id -> list_of_rows ----
     mapping = None
-
     if isinstance(raw, dict):
-        # unwrap common wrappers
         if "clients" in raw and isinstance(raw["clients"], (dict, list)):
             mapping = raw["clients"]
         elif "maids" in raw and isinstance(raw["maids"], (dict, list)):
             mapping = raw["maids"]
         elif "entities" in raw and isinstance(raw["entities"], list):
-            # e.g. {"entities":[{"id": "...", "rows":[...]}, ...]}
             mapping = {}
             for e in raw["entities"]:
                 if not isinstance(e, dict):
@@ -1975,8 +1965,6 @@ def _load_theme_map(file, entity_key: str) -> dict[str, dict[str, int]]:
                     rows = []
                 mapping[k] = rows
         else:
-            # Could already be {id: [rows], ...}
-            # Or {id: {single_row}}, normalize single_row -> [single_row]
             ok = True
             for v in raw.values():
                 if not isinstance(v, (list, dict, type(None))):
@@ -1996,7 +1984,6 @@ def _load_theme_map(file, entity_key: str) -> dict[str, dict[str, int]]:
                     mapping[str(k)] = rows
 
     if mapping is None and isinstance(raw, list):
-        # list of row objects → group by entity_key
         mapping = {}
         for r in raw:
             if not isinstance(r, dict):
@@ -2013,13 +2000,10 @@ def _load_theme_map(file, entity_key: str) -> dict[str, dict[str, int]]:
             mapping.setdefault(k, []).append(r)
 
     if mapping is None:
-        # Unknown shape → treat as empty
         return {}
 
-    # ---- collapse to id -> Counter(theme) ----
     theme_map: dict[str, dict[str, int]] = {}
     for ent_id, rows in mapping.items():
-        # sanitize rows
         if rows is None:
             rows = []
         if isinstance(rows, dict):
@@ -2032,7 +2016,6 @@ def _load_theme_map(file, entity_key: str) -> dict[str, dict[str, int]]:
             if not isinstance(r, dict):
                 continue
 
-            # accept both naming conventions
             all_themes = []
             for key in ("all_case_themes", "themes", "all_themes"):
                 v = r.get(key)
@@ -2044,12 +2027,12 @@ def _load_theme_map(file, entity_key: str) -> dict[str, dict[str, int]]:
                     all_themes.extend(v)
 
             for t in all_themes:
-                t = _norm_theme(t)  # <-- normalized (was: str(t).strip().lower())
+                t = _norm_theme(t)  # <-- normalize
                 if not t:
                     continue
                 counter[t] = counter.get(t, 0) + 1
 
-        theme_map[str(ent_id).strip()] = counter  # <-- strip IDs when storing
+        theme_map[str(ent_id).strip()] = counter  # strip IDs when storing
 
     return theme_map
 
@@ -2090,7 +2073,6 @@ maids   = sorted(df_work["maid_id"].unique().tolist())
 # Optional filter by cc_type to keep apples-to-apples
 same_cc = st.checkbox("Only match clients ⇄ maids within the same cc_type group (if present)", value=False)
 if same_cc and "cc_type" in df_work.columns:
-    # Ensure each maid seen with one cc_type; if not, we won't filter by it
     pass
 
 # ---------- 3) Build theme-based compatibility adjustment ----------
@@ -2109,16 +2091,11 @@ def theme_adjustment(client_id: str, maid_id: str) -> tuple[int, list]:
     overlaps = sorted(set(cbag.keys()) & set(mbag.keys()))
     if not overlaps:
         return 0, []
-    # simple penalty: count overlaps, weighted very lightly by sum of freq (bounded)
-    raw_pen = 0
-    for t in overlaps:
-        raw_pen += 1  # one unit per overlapping theme
+    raw_pen = len(overlaps)
     pen = int(np.clip(raw_pen * overlap_penalty, penalty_cap, 0))
     return pen, overlaps
 
 # ---------- 4) Compose composite score per candidate pair ----------
-# Build small lookup of base model score & score_notes per (client, maid)
-# If you computed scores on each row (client—maid), we’ll use that. If missing, we recompute.
 if "match_score" not in df_work.columns or "decision" not in df_work.columns or "score_notes" not in df_work.columns:
     with st.spinner("Scoring (balanced policy)…"):
         df_work = apply_matching_score(df_work, policy="balanced")
@@ -2132,14 +2109,13 @@ for _, r in df_work.iterrows():
         "decision": str(r.get("decision", "") or ""),
     }
 
-# “Matching types” helpers
 client_cols = [c for c in df_work.columns if c.startswith("clientmts_")]
 maid_cols_mts   = [c for c in df_work.columns if c.startswith("maidmts_")]
 maid_cols_pref  = [c for c in df_work.columns if c.startswith("maidpref_")]
 
-# ---- UPDATED: more defensive (populates JSON boxes reliably) ----
+# === UPDATED: add a fallback that derives maid/client types from flags when mts/pref are empty ===
 def _types_row(client_id: str, maid_id: str) -> dict:
-    # Match on string + strip to avoid subtle whitespace mismatches
+    # robust string match (strip)
     df_pair = df_work[
         (df_work["client_name"].astype(str).str.strip() == str(client_id).strip()) &
         (df_work["maid_id"].astype(str).str.strip()     == str(maid_id).strip())
@@ -2162,6 +2138,85 @@ def _types_row(client_id: str, maid_id: str) -> dict:
 
     client_types = _grab(client_cols)
     maid_types   = _grab(maid_cols_mts + maid_cols_pref)
+
+    # ---- Fallbacks (maid) if engineered strings are all empty ----
+    if not maid_types:
+        derived = {}
+
+        # day-off
+        if int(r.get("dayoff_flexible", 0)) == 1:
+            derived["dayoff_policy"] = "flexible"
+        elif int(r.get("dayoff_sunday_only", 0)) == 1:
+            derived["dayoff_policy"] = "sunday_only"
+
+        # mobility
+        mob = int(r.get("mobility_flex", 0) if pd.notna(r.get("mobility_flex", 0)) else 0)
+        if mob == 2:
+            derived["mobility"] = "travel_and_relocate"
+        elif mob == 1:
+            derived["mobility"] = "travel_or_relocate"
+
+        # education (use engineered string if present; otherwise from flags)
+        edu = str(r.get("maidpref_education", "") or "").strip()
+        if edu and edu not in ("none", "unspecified", "not_specified"):
+            derived["education"] = edu
+        else:
+            if int(r.get("edu_university", 0)) == 1:
+                derived["education"] = "university"
+            elif int(r.get("edu_school", 0)) == 1:
+                derived["education"] = "school"
+
+        # caregiving
+        care = str(r.get("maidpref_caregiving_profile", "") or "").strip()
+        if care and care != "none":
+            derived["caregiving"] = care
+        else:
+            elder = int(r.get("elderly_ok", 0)) == 1
+            special = int(r.get("special_ok", 0)) == 1
+            if elder and special:
+                derived["caregiving"] = "elderly_and_special"
+            elif elder or special:
+                derived["caregiving"] = "one_of_elderly_or_special"
+
+        # pets / infants blocks (from MTS flags)
+        if int(r.get("infant_block", 0)) == 1:
+            derived["infant_block"] = "yes"
+        if int(r.get("manykids_block", 0)) == 1:
+            derived["many_kids_block"] = "yes"
+        if int(r.get("cats_block", 0)) == 1:
+            derived["cats_block"] = "yes"
+        if int(r.get("dogs_block", 0)) == 1:
+            derived["dogs_block"] = "yes"
+
+        # smoking
+        if int(r.get("maid_non_smoker_flag", 0)) == 1:
+            derived["non_smoker"] = "yes"
+
+        # personality (soft traits)
+        soft = []
+        for key, label in [("energetic","energetic"), ("no_attitude","no_attitude"),
+                           ("no_tiktok","no_tiktok"), ("veg_friendly","veg_friendly")]:
+            if int(r.get(key, 0)) == 1:
+                soft.append(label)
+        if soft:
+            derived["soft_traits"] = f"{len(soft)}({','.join(soft)})"
+
+        maid_types = derived
+
+    # ---- Fallbacks (client) in the very rare case all engineered are empty ----
+    if not client_types:
+        derived_c = {}
+        # pull a few key engineered client fields if present
+        for col in ("clientmts_household_type", "clientmts_pet_type",
+                    "clientmts_dayoff_policy", "clientmts_living_arrangement",
+                    "clientmts_cuisine_preference", "clientmts_nationality_preference",
+                    "clientmts_special_cases"):
+            if col in r.index:
+                v = str(r.get(col, "") or "").strip()
+                if v and v not in ("none", "unspecified", "not_specified", "other"):
+                    derived_c[col] = v
+        client_types = derived_c
+
     return {"client": client_types, "maid": maid_types}
 
 # ---------- 5) Build the score matrix ----------
@@ -2176,17 +2231,15 @@ if nC == 0 or nM == 0:
     st.warning("Not enough clients or maids to build an assignment.")
     st.stop()
 
-# Create matrix of composite scores; fill with very low scores for missing combos
 S = np.zeros((nC, nM), dtype=float)
-meta = [[None for _ in range(nM)] for __ in range(nC)]  # keep reasons & types
+meta = [[None for _ in range(nM)] for __ in range(nC)]
 
 for i, cid in enumerate(clients_use):
     for j, mid in enumerate(maids_use):
         base = row_lookup.get((cid, mid), {"base": 0.0, "notes": "", "decision": ""})
         base_score = base["base"]
-        # Theme penalty
         t_pen, t_overlap = theme_adjustment(cid, mid)
-        composite = base_weight * base_score + (t_pen)  # t_pen is negative or zero
+        composite = base_weight * base_score + (t_pen)
 
         S[i, j] = composite
         meta[i][j] = {
@@ -2200,17 +2253,14 @@ for i, cid in enumerate(clients_use):
 # ---------- 6) Solve assignment (maximize S) ----------
 assign_info = []
 try:
-    # Hungarian solves min-cost; convert by negating
     from scipy.optimize import linear_sum_assignment
     cost = -S
     ri, cj = linear_sum_assignment(cost)
     for i, j in zip(ri, cj):
         assign_info.append(meta[i][j])
 except Exception:
-    # Fallback: greedy (still reasonable for small sets)
     st.warning("SciPy not available — using greedy assignment fallback.")
     seenC, seenM = set(), set()
-    # rank all pairs by composite desc
     pairs = []
     for i in range(nC):
         for j in range(nM):
@@ -2232,7 +2282,6 @@ st.subheader("Suggested assignments (optimal set)")
 rows_for_df = []
 for a in assign_info:
     overlaps = ", ".join(a["overlaps"]) if a["overlaps"] else "—"
-    # concise reasons: keep the core ‘score_notes’ and theme blurb
     reason_bits = []
     if a["notes"]:
         reason_bits.append(a["notes"])
@@ -2240,10 +2289,16 @@ for a in assign_info:
         reason_bits.append(f"Theme risk overlap: {overlaps}")
     reason = " | ".join(reason_bits)
 
-    # matching types (short)
     ct = a["types"]["client"]; mt = a["types"]["maid"]
-    ct_show = ", ".join([f"{k.replace('clientmts_','')}: {v}" for k,v in ct.items() if isinstance(v,str) and v not in ("none","unspecified","not_specified")])
-    mt_show = ", ".join([f"{k.replace('maidmts_','').replace('maidpref_','')}: {v}" for k,v in mt.items() if isinstance(v,str) and v not in ("none","unspecified","not_specified")])
+    ct_show = ", ".join([f"{k.replace('clientmts_','')}: {v}" for k,v in ct.items()
+                         if isinstance(v, str) and v not in ("none","unspecified","not_specified")])
+    if not ct_show and ct:
+        ct_show = ", ".join([f"{k}: {v}" for k,v in ct.items()])
+
+    mt_show = ", ".join([f"{k.replace('maidmts_','').replace('maidpref_','')}: {v}" for k,v in mt.items()
+                         if isinstance(v, str) and v not in ("none","unspecified","not_specified")])
+    if not mt_show and mt:
+        mt_show = ", ".join([f"{k}: {v}" for k,v in mt.items()])
 
     rows_for_df.append({
         "client_name": a["client"],
@@ -2260,15 +2315,13 @@ for a in assign_info:
 
 assign_df = pd.DataFrame(rows_for_df).sort_values("composite_score", ascending=False)
 
-# Color style
 def _color_score(val):
     if pd.isna(val): return ""
-    # green high, red low
     v = float(val)
     if v >= 85:  color = "#2e7d32"
     elif v >= 70: color = "#388e3c"
     elif v >= 55: color = "#558b2f"
-    elif v >= 40: color = "#8e24aa"  # mid
+    elif v >= 40: color = "#8e24aa"
     else:         color = "#c62828"
     return f"background-color:{color};color:white"
 
@@ -2280,7 +2333,6 @@ st.dataframe(
     hide_index=True
 )
 
-# Download
 st.download_button(
     "⬇️ Download assignments CSV",
     data=assign_df.to_csv(index=False).encode("utf-8"),
@@ -2296,7 +2348,6 @@ with cc1:
 with cc2:
     pick_maid = st.selectbox("Maid", maids_use, key="explain_maid")
 
-# Find the meta for this pair
 ex = None
 try:
     i = clients_use.index(pick_client); j = maids_use.index(pick_maid)
