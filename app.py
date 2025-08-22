@@ -2123,112 +2123,42 @@ client_cols = [c for c in df_work.columns if c.startswith("clientmts_")]
 maid_cols_mts   = [c for c in df_work.columns if c.startswith("maidmts_")]
 maid_cols_pref  = [c for c in df_work.columns if c.startswith("maidpref_")]
 
-# === UPDATED: add a fallback that derives maid/client types from flags when mts/pref are empty ===
 def _types_row(client_id: str, maid_id: str) -> dict:
-    # robust string match (strip)
-    df_pair = df_work[
-        (df_work["client_name"].astype(str).str.strip() == str(client_id).strip()) &
-        (df_work["maid_id"].astype(str).str.strip()     == str(maid_id).strip())
-    ]
-    if df_pair.empty:
-        return {"client": {}, "maid": {}}
-
-    r = df_pair.iloc[0]
-
-    def _grab(cols):
-        out = {}
-        for c in cols:
-            if c in r.index:
-                v = r[c]
-                if pd.notna(v):
-                    vs = str(v).strip()
-                    if vs and vs not in ("none", "unspecified", "not_specified"):
-                        out[c] = vs
-        return out
-
-    client_types = _grab(client_cols)
-    maid_types   = _grab(maid_cols_mts + maid_cols_pref)
-
-    # ---- Fallbacks (maid) if engineered strings are all empty ----
-    if not maid_types:
-        derived = {}
-
-        # day-off
-        if int(r.get("dayoff_flexible", 0)) == 1:
-            derived["dayoff_policy"] = "flexible"
-        elif int(r.get("dayoff_sunday_only", 0)) == 1:
-            derived["dayoff_policy"] = "sunday_only"
-
-        # mobility
-        mob = int(r.get("mobility_flex", 0) if pd.notna(r.get("mobility_flex", 0)) else 0)
-        if mob == 2:
-            derived["mobility"] = "travel_and_relocate"
-        elif mob == 1:
-            derived["mobility"] = "travel_or_relocate"
-
-        # education (use engineered string if present; otherwise from flags)
-        edu = str(r.get("maidpref_education", "") or "").strip()
-        if edu and edu not in ("none", "unspecified", "not_specified"):
-            derived["education"] = edu
+    """Return engineered matching types for the client & maid.
+    1) Try the exact (client, maid) row.
+    2) If absent, fall back to the latest row for that client (any maid).
+    3) Likewise for the maid (any client).
+    """
+    def _latest(mask, cols):
+        if not mask.any():
+            return {}
+        sub = df_work.loc[mask, cols + (["tag_date"] if "tag_date" in df_work.columns else [])]
+        if sub.empty:
+            return {}
+        if "tag_date" in sub.columns:
+            sub = sub.sort_values("tag_date").iloc[-1]
         else:
-            if int(r.get("edu_university", 0)) == 1:
-                derived["education"] = "university"
-            elif int(r.get("edu_school", 0)) == 1:
-                derived["education"] = "school"
+            sub = sub.iloc[0]
+        return {c: sub[c] for c in cols if pd.notna(sub.get(c))}
 
-        # caregiving
-        care = str(r.get("maidpref_caregiving_profile", "") or "").strip()
-        if care and care != "none":
-            derived["caregiving"] = care
-        else:
-            elder = int(r.get("elderly_ok", 0)) == 1
-            special = int(r.get("special_ok", 0)) == 1
-            if elder and special:
-                derived["caregiving"] = "elderly_and_special"
-            elif elder or special:
-                derived["caregiving"] = "one_of_elderly_or_special"
+    # 1) Try exact pair
+    pair_mask = (df_work["client_name"].astype(str) == str(client_id)) & \
+                (df_work["maid_id"].astype(str)     == str(maid_id))
 
-        # pets / infants blocks (from MTS flags)
-        if int(r.get("infant_block", 0)) == 1:
-            derived["infant_block"] = "yes"
-        if int(r.get("manykids_block", 0)) == 1:
-            derived["many_kids_block"] = "yes"
-        if int(r.get("cats_block", 0)) == 1:
-            derived["cats_block"] = "yes"
-        if int(r.get("dogs_block", 0)) == 1:
-            derived["dogs_block"] = "yes"
+    if pair_mask.any():
+        row = df_work.loc[pair_mask].sort_values("tag_date").iloc[-1] if "tag_date" in df_work.columns \
+              else df_work.loc[pair_mask].iloc[0]
+        client_types = {c: row[c] for c in client_cols if pd.notna(row.get(c))}
+        maid_types   = {c: row[c] for c in (maid_cols_mts + maid_cols_pref) if pd.notna(row.get(c))}
+        return {"client": client_types, "maid": maid_types}
 
-        # smoking
-        if int(r.get("maid_non_smoker_flag", 0)) == 1:
-            derived["non_smoker"] = "yes"
+    # 2) Fall back: latest for this client (any maid)
+    client_types = _latest(df_work["client_name"].astype(str).eq(str(client_id)), client_cols)
 
-        # personality (soft traits)
-        soft = []
-        for key, label in [("energetic","energetic"), ("no_attitude","no_attitude"),
-                           ("no_tiktok","no_tiktok"), ("veg_friendly","veg_friendly")]:
-            if int(r.get(key, 0)) == 1:
-                soft.append(label)
-        if soft:
-            derived["soft_traits"] = f"{len(soft)}({','.join(soft)})"
-
-        maid_types = derived
-
-    # ---- Fallbacks (client) in the very rare case all engineered are empty ----
-    if not client_types:
-        derived_c = {}
-        # pull a few key engineered client fields if present
-        for col in ("clientmts_household_type", "clientmts_pet_type",
-                    "clientmts_dayoff_policy", "clientmts_living_arrangement",
-                    "clientmts_cuisine_preference", "clientmts_nationality_preference",
-                    "clientmts_special_cases"):
-            if col in r.index:
-                v = str(r.get(col, "") or "").strip()
-                if v and v not in ("none", "unspecified", "not_specified", "other"):
-                    derived_c[col] = v
-        client_types = derived_c
+    # 3) Fall back: latest for this maid (any client)
+    maid_types   = _latest(df_work["maid_id"].astype(str).eq(str(maid_id)), maid_cols_mts + maid_cols_pref)
 
     return {"client": client_types, "maid": maid_types}
-
 # ---------- 5) Build the score matrix ----------
 clients_use = clients[:]
 maids_use   = maids[:]
