@@ -1347,9 +1347,11 @@ else:
 # ==============================================
 import hashlib
 from collections import Counter
+from html import escape as _html_escape
 
 st.markdown("---")
 st.header("Client ↔︎ Maid Themes Explorer")
+
 # Inline prompt just for this explorer
 with st.expander("System instruction used below (Gemini)", expanded=True):
     explorer_prompt = st.text_area(
@@ -1395,7 +1397,7 @@ def _chip(text, kind="theme"):
     bg = {"theme":"#3949ab", "sub":"#00897b", "warn":"#ef6c00"}.get(kind, "#546e7a")
     return f"""<span style="display:inline-block;margin:2px 6px 2px 0;
     padding:4px 8px;border-radius:12px;background:{bg};color:white;
-    font-size:12px;white-space:nowrap;">{text}</span>"""
+    font-size:12px;white-space:nowrap;">{_html_escape(str(text))}</span>"""
 
 @st.cache_data(show_spinner=False, ttl=60*60*24)
 def _hash_key(s: str) -> str:
@@ -1440,16 +1442,12 @@ def extract_themes_cached(system_prompt: str, complaint_text: str, return_raw: b
     if return_raw: res["raw"] = out
     return res
 
-
-
 def _prep_subset(df: pd.DataFrame):
     s = df.copy()
     s["complaint_summary"]  = s["complaint_summary"].astype(str).str.strip()
     s["complaint_comments"] = s["complaint_comments"].astype(str).str.strip()
     mask = s["complaint_summary"].str.lower().ne("no complaint") & s["complaint_summary"].ne("")
     return s.loc[mask].head(int(max_rows_each))
-
-from collections import Counter
 
 def _summarize_theme_counts(themed_rows):
     theme_counter = Counter()
@@ -1459,11 +1457,9 @@ def _summarize_theme_counts(themed_rows):
         # accept either 'subcats' or legacy 'subcategories'
         subs = (r.get("subcats") or r.get("subcategories") or [])
         sub_counter.update(subs)
-
     top_themes = pd.DataFrame(theme_counter.most_common(20), columns=["theme", "count"])
     top_subs   = pd.DataFrame(sub_counter.most_common(20),   columns=["subcategory", "count"])
     return top_themes, top_subs
-
 
 def _render_rows(df_subset, section_title, system_prompt: str):
     st.subheader(section_title)
@@ -1486,7 +1482,7 @@ def _render_rows(df_subset, section_title, system_prompt: str):
             "complaint_summary":  row["complaint_summary"],
             "complaint_comments": row["complaint_comments"],
             "themes":  res.get("themes", []),
-            "subcats": res.get("subcats", []),   # <- use 'subcats'
+            "subcats": res.get("subcats", []),
         })
         prog.progress(k/len(df_subset))
 
@@ -1504,25 +1500,33 @@ def _render_rows(df_subset, section_title, system_prompt: str):
 
     # Pretty rows
     st.caption("Labeled complaints")
+
     def _row_html(r):
         theme_html = " ".join(_chip(t, "theme") for t in (r.get("themes")  or []))
         sub_html   = " ".join(_chip(t, "sub")   for t in (r.get("subcats") or []))
-        comments   = r["complaint_comments"] or "—"
+
+        # Safe-escape all user text and preserve newlines in comments/summary
+        summary  = _html_escape(str(r.get("complaint_summary", ""))).replace("\n", "<br>")
+        comments = _html_escape(str(r.get("complaint_comments", "—"))).replace("\n", "<br>")
+        client   = _html_escape(str(r.get("client_name", "")))
+        maid     = _html_escape(str(r.get("maid_id", "")))
+        tag_date = _html_escape(str(r.get("tag_date", "")))
+
         return f"""
         <div style="border:1px solid #263238;border-radius:10px;padding:10px;margin-bottom:10px;">
-          <div style="font-weight:600">{r.get('client_name','')} → maid {r.get('maid_id','')}</div>
-          <div style="opacity:.8;font-size:12px;margin-bottom:6px;">{r.get('tag_date','')}</div>
-          <div style="margin:6px 0;"><strong>Summary:</strong> {st.escape_markdown(str(r['complaint_summary']))}</div>
+          <div style="font-weight:600">{client} → maid {maid}</div>
+          <div style="opacity:.8;font-size:12px;margin-bottom:6px;">{tag_date}</div>
+          <div style="margin:6px 0;"><strong>Summary:</strong> {summary}</div>
           <div style="margin:4px 0;">{theme_html}</div>
           <div style="margin:4px 0;">{sub_html}</div>
-          <div style="margin-top:6px;color:#cfd8dc;"><em>Client comments:</em> {st.escape_markdown(str(comments))}</div>
+          <div style="margin-top:6px;color:#cfd8dc;"><em>Client comments:</em> {comments}</div>
         </div>
         """
 
     html = "\n".join(_row_html(r) for _, r in out_df.iterrows())
     st.markdown(html, unsafe_allow_html=True)
 
-      # --- Export (REPLACE your old export block with this) ---
+    # --- Export ---
     def _join_list(x):
         if isinstance(x, list):
             return "; ".join(map(str, x))
@@ -1533,7 +1537,6 @@ def _render_rows(df_subset, section_title, system_prompt: str):
     export_df["subcats"] = export_df["subcats"].apply(_join_list)
 
     csv_bytes = export_df.to_csv(index=False).encode("utf-8")
-
     st.download_button(
         f"⬇️ Download {section_title} themes",
         data=csv_bytes,
@@ -1542,7 +1545,7 @@ def _render_rows(df_subset, section_title, system_prompt: str):
     )
 
     return out_df
-    
+
 # --------- build the three views ---------
 client_subset = _prep_subset(df_source[df_source["client_name"].astype(str) == str(sel_client)])
 maid_subset   = _prep_subset(df_source[df_source["maid_id"].astype(str) == str(sel_maid)])
@@ -1569,8 +1572,7 @@ if st.button("🧩 Extract themes for client, maid, and client→maid"):
     else:
         st.caption("Client comments about this maid")
         for _, r in pair_subset.iterrows():
-            cm = r.get("complaint_comments") or ""
+            cm = str(r.get("complaint_comments") or "")
             if cm and cm.lower() != "no complaint":
-                st.markdown(f"- {cm}")
+                st.markdown(f"- {_html_escape(cm)}")
         _render_rows(pair_subset, "Client→Maid", explorer_prompt)
-
