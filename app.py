@@ -1878,429 +1878,334 @@ with tab_maids:
 
 
 # ==============================================
-# Step 5 — Auto Assignment (Themes + Matching Score)
+# Auto-Assignment (Themes × Matching Score)
 # ==============================================
-import json
-import math
-import numpy as np
+import json, re
 import pandas as pd
 import streamlit as st
 
 st.markdown("---")
-st.header("Auto-Assignment (Themes ✕ Matching Score)")
+st.header("Auto-Assignment (Themes × Matching Score)")
 
-# ---------- 0) Pull a source DF ----------
-df_scored     = st.session_state.get("scored_df")
-df_engineered = st.session_state.get("engineered_df")
-df_source = None
+# -------------------------
+# Pull a working DataFrame
+# -------------------------
+df_scored     = st.session_state.get("scored_df")       # optional (has match_score/decision/score_notes)
+df_engineered = st.session_state.get("engineered_df")   # required columns for client/maid types
 
+work = None
 if isinstance(df_scored, pd.DataFrame) and not df_scored.empty:
-    df_source = df_scored.copy()
+    work = df_scored.copy()
 elif isinstance(df_engineered, pd.DataFrame) and not df_engineered.empty:
-    # compute scores if needed
-    with st.spinner("Scoring (balanced policy)…"):
-        df_source = apply_matching_score(df_engineered.copy(), policy="balanced")
-else:
-    st.warning("Please run Cleaning → Feature Engineering first (and Scoring if you want a custom policy).")
+    work = df_engineered.copy()
+
+if work is None or work.empty:
+    st.info("Run Feature Engineering (and optionally Matching Score) first, then return here.")
     st.stop()
 
-# Ensure basic identifiers exist and are strings
-for col in ["client_name", "maid_id"]:
-    if col not in df_source.columns:
-        st.error(f"Missing column in dataset: {col}")
-        st.stop()
-df_source["client_name"] = df_source["client_name"].astype(str)
-df_source["maid_id"]     = df_source["maid_id"].astype(str)
+# Normalize key ID fields we’ll use
+for c in ["client_name", "maid_id", "cc_type"]:
+    if c in work.columns:
+        work[c] = work[c].astype(str).str.strip()
 
-# ---------- 1) Optional: upload themes JSON produced by your Bulk JSON export ----------
+# Ensure model_score exists (use match_score if available, else 50 baseline)
+if "model_score" not in work.columns:
+    if "match_score" in work.columns:
+        work["model_score"] = work["match_score"].astype(float)
+    else:
+        work["model_score"] = 50.0
+
+# -------------------------
+# Theme JSON uploaders
+# -------------------------
 st.subheader("Themes inputs (optional)")
-c1, c2 = st.columns(2)
-with c1:
-    client_json_file = st.file_uploader("Client themes JSON", type=["json"], key="client_themes_json_up")
-with c2:
-    maid_json_file = st.file_uploader("Maid themes JSON", type=["json"], key="maid_themes_json_up")
+col_up1, col_up2 = st.columns(2)
+with col_up1:
+    client_themes_json = st.file_uploader(
+        "Client themes JSON",
+        type=["json"],
+        key="client_themes_json_upl"
+    )
+with col_up2:
+    maid_themes_json = st.file_uploader(
+        "Maid themes JSON",
+        type=["json"],
+        key="maid_themes_json_upl"
+    )
 
-def _load_theme_map(file, entity_key: str) -> dict[str, dict[str, int]]:
+# -------------------------
+# Helpers for themes & types
+# -------------------------
+def _norm_theme(s) -> str:
+    """Normalize a theme token so both JSONs collide reliably."""
+    return re.sub(r"[^a-z0-9]+", "_", str(s).lower()).strip("_")
+
+def _read_json(uploaded_or_dict):
+    """Accepts a Streamlit UploadedFile or a dict/list; returns parsed object or None."""
+    if uploaded_or_dict is None:
+        return None
+    if isinstance(uploaded_or_dict, (dict, list)):
+        return uploaded_or_dict
+    try:
+        uploaded_or_dict.seek(0)
+    except Exception:
+        pass
+    raw = getattr(uploaded_or_dict, "getvalue", lambda: uploaded_or_dict.read())()
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="ignore")
+    return json.loads(raw)
+
+def _load_theme_map(uploaded_or_dict, id_field: str) -> dict:
     """
-    Robustly load your themes JSON and return:
-        { <entity_id>: { <theme>: frequency, ... }, ... }
-
-    Accepts shapes:
-      1) { "<id>": [ {all_case_themes:[], subcategory_themes:[]}, ... ], ... }
-      2) { "clients" | "maids" | "entities": [...] }  (unwraps)
-      3) [ {client_name/maid_id: "...", all_case_themes:[], subcategory_themes:[]}, ... ]
-      4) rows using keys 'themes'/'subcats'/'subcategories' instead of 'all_case_themes'/'subcategory_themes'
+    Build {<id>: {<normalized_theme>: count, ...}, ...}
+    Accepts either the raw JSON (list/dict) or the UploadedFile.
+    Works with "all_case_themes"/"subcategory_themes" or "themes"/"subcats".
     """
-    if not file:
+    data = _read_json(uploaded_or_dict)
+    if not data:
         return {}
-
-    import json
-    file.seek(0)
-    raw = json.loads(file.read().decode("utf-8"))
-
-    # ---- unify into a mapping: id -> list_of_rows ----
-    mapping = None
-
-    if isinstance(raw, dict):
-        # unwrap common wrappers
-        if "clients" in raw and isinstance(raw["clients"], (dict, list)):
-            mapping = raw["clients"]
-        elif "maids" in raw and isinstance(raw["maids"], (dict, list)):
-            mapping = raw["maids"]
-        elif "entities" in raw and isinstance(raw["entities"], list):
-            # e.g. {"entities":[{"id": "...", "rows":[...]}, ...]}
-            mapping = {}
-            for e in raw["entities"]:
-                if not isinstance(e, dict):
-                    continue
-                k = str(
-                    e.get("id")
-                    or e.get(entity_key)
-                    or e.get("client_name")
-                    or e.get("maid_id")
-                    or ""
-                )
-                if not k:
-                    continue
-                rows = e.get("rows") or e.get("items") or e.get("complaints") or []
-                if isinstance(rows, dict):
-                    rows = [rows]
-                if not isinstance(rows, list):
-                    rows = []
-                mapping[k] = rows
-        else:
-            # Could already be {id: [rows], ...}
-            # Or {id: {single_row}}, normalize single_row -> [single_row]
-            ok = True
-            for v in raw.values():
-                if not isinstance(v, (list, dict, type(None))):
-                    ok = False
-                    break
-            if ok:
-                mapping = {}
-                for k, v in raw.items():
-                    if v is None:
-                        rows = []
-                    elif isinstance(v, dict):
-                        rows = [v]
-                    elif isinstance(v, list):
-                        rows = v
-                    else:
-                        rows = []
-                    mapping[str(k)] = rows
-
-    if mapping is None and isinstance(raw, list):
-        # list of row objects → group by entity_key
-        mapping = {}
-        for r in raw:
-            if not isinstance(r, dict):
-                continue
-            k = str(
-                r.get(entity_key)
-                or r.get("id")
-                or r.get("client_name")
-                or r.get("maid_id")
-                or ""
-            )
-            if not k:
-                continue
-            mapping.setdefault(k, []).append(r)
-
-    if mapping is None:
-        # Unknown shape → treat as empty
-        return {}
-
-    # ---- collapse to id -> Counter(theme) ----
     theme_map: dict[str, dict[str, int]] = {}
-    for ent_id, rows in mapping.items():
-        # sanitize rows
-        if rows is None:
-            rows = []
-        if isinstance(rows, dict):
-            rows = [rows]
-        if not isinstance(rows, list):
-            rows = []
 
-        counter: dict[str, int] = {}
-        for r in rows:
-            if not isinstance(r, dict):
+    def _ingest(k: str, row: dict):
+        key = str(k).strip()
+        if not key:
+            return
+        arr  = row.get("all_case_themes") or row.get("themes")  or []
+        subs = row.get("subcategory_themes") or row.get("subcats") or []
+        tokens = [_norm_theme(t) for t in (list(arr) + list(subs))]
+        counts: dict[str, int] = {}
+        for t in tokens:
+            if not t:
                 continue
+            counts[t] = counts.get(t, 0) + 1
+        if counts:
+            theme_map[key] = counts
 
-            # accept both naming conventions
-            all_themes = []
-            for key in ("all_case_themes", "themes", "all_themes"):
-                v = r.get(key)
-                if isinstance(v, list):
-                    all_themes.extend(v)
-            for key in ("subcategory_themes", "subcats", "subcategories"):
-                v = r.get(key)
-                if isinstance(v, list):
-                    all_themes.extend(v)
-
-            for t in all_themes:
-                t = str(t).strip().lower()
-                if not t:
-                    continue
-                counter[t] = counter.get(t, 0) + 1
-
-        theme_map[str(ent_id)] = counter
+    if isinstance(data, list):
+        for row in data:
+            _ingest(str(row.get(id_field, "")).strip(), row)
+    elif isinstance(data, dict):
+        for k, v in data.items():
+            if isinstance(v, dict):
+                _ingest(str(k).strip(), v)
 
     return theme_map
 
-client_theme_map = _load_theme_map(client_json_file, "client_name")
-maid_theme_map   = _load_theme_map(maid_json_file, "maid_id")
+def compute_theme_overlap_penalty(
+    client_key,
+    maid_key,
+    client_theme_map: dict,
+    maid_theme_map: dict,
+    penalty_per_theme: float = -8.0,
+    cap_total: float | None = -25.0,
+):
+    """Returns (overlap_list, penalty_value)."""
+    ck = str(client_key).strip()
+    mk = str(maid_key).strip()
+    c_counts = client_theme_map.get(ck, {}) or {}
+    m_counts = maid_theme_map.get(mk, {})   or {}
+    overlap = sorted(set(c_counts).intersection(m_counts))
+    penalty = 0.0
+    if overlap and penalty_per_theme:
+        penalty = penalty_per_theme * len(overlap)
+        if cap_total is not None:
+            if penalty_per_theme < 0:
+                penalty = max(cap_total, penalty)     # negative cap
+            else:
+                penalty = min(cap_total, penalty)
+    return overlap, float(penalty)
 
-# Small helper to show what we loaded
-def _spark_terms(d, n=8):
-    terms = sorted(d.items(), key=lambda kv: (-kv[1], kv[0]))[:n]
-    return ", ".join([f"{k}×{v}" for k,v in terms]) if terms else "—"
-
-if client_theme_map or maid_theme_map:
-    st.info(f"Loaded themes — clients: {len(client_theme_map)}; maids: {len(maid_theme_map)}")
-
-# ---------- 2) Controls ----------
-st.subheader("Scoring mix & constraints")
-colA, colB, colC, colD = st.columns([1,1,1,1])
-with colA:
-    base_weight = st.slider("Weight: model score (0–1)", 0.0, 1.0, 1.0, 0.05)
-with colB:
-    overlap_penalty = st.slider("Penalty per overlapping theme", -40, 0, -8, 1)
-with colC:
-    penalty_cap = st.slider("Cap: total theme penalty", -100, 0, -30, 1)
-with colD:
-    max_pairs = st.number_input("Max clients to assign (0=all)", min_value=0, value=0, step=10)
-
-# Optional: keep only the latest tag_date per (client, maid) if duplicates
-df_work = df_source.copy()
-if "tag_date" in df_work.columns:
-    df_work["tag_date"] = pd.to_datetime(df_work["tag_date"], errors="coerce")
-    df_work.sort_values(["client_name","maid_id","tag_date"], ascending=[True,True,False], inplace=True)
-    df_work = df_work.drop_duplicates(subset=["client_name","maid_id"], keep="first")
-
-# Pick populations
-clients = sorted(df_work["client_name"].unique().tolist())
-maids   = sorted(df_work["maid_id"].unique().tolist())
-
-# Optional filter by cc_type to keep apples-to-apples
-same_cc = st.checkbox("Only match clients ⇄ maids within the same cc_type group (if present)", value=False)
-if same_cc and "cc_type" in df_work.columns:
-    # Ensure each maid seen with one cc_type; if not, we won't filter by it
-    pass
-
-# ---------- 3) Build theme-based compatibility adjustment ----------
-def theme_adjustment(client_id: str, maid_id: str) -> tuple[int, list]:
-    """
-    Negative penalty for overlapping 'risk' themes:
-      - what this client has complained about historically
-      - what others have complained about this maid
-    Returns (penalty_int, list_of_overlaps)
-    """
-    cbag = client_theme_map.get(client_id, {})
-    mbag = maid_theme_map.get(maid_id, {})
-    if not cbag or not mbag:
-        return 0, []
-
-    overlaps = sorted(set(cbag.keys()) & set(mbag.keys()))
-    if not overlaps:
-        return 0, []
-    # simple penalty: count overlaps, weighted very lightly by sum of freq (bounded)
-    raw_pen = 0
-    for t in overlaps:
-        raw_pen += 1  # one unit per overlapping theme
-    pen = int(np.clip(raw_pen * overlap_penalty, penalty_cap, 0))
-    return pen, overlaps
-
-# ---------- 4) Compose composite score per candidate pair ----------
-# Build small lookup of base model score & score_notes per (client, maid)
-# If you computed scores on each row (client—maid), we’ll use that. If missing, we recompute.
-if "match_score" not in df_work.columns or "decision" not in df_work.columns or "score_notes" not in df_work.columns:
-    with st.spinner("Scoring (balanced policy)…"):
-        df_work = apply_matching_score(df_work, policy="balanced")
-
-row_lookup = {}
-for _, r in df_work.iterrows():
-    key = (str(r["client_name"]), str(r["maid_id"]))
-    row_lookup[key] = {
-        "base": float(r.get("match_score", 0.0) or 0.0),
-        "notes": str(r.get("score_notes", "") or ""),
-        "decision": str(r.get("decision", "") or ""),
+def _client_types_from_row(r: dict) -> dict:
+    return {
+        "household_type":         r.get("clientmts_household_type", "none"),
+        "special_cases":          r.get("clientmts_special_cases", "none"),
+        "pets":                   r.get("clientmts_pet_type", "none"),
+        "dayoff_policy":          r.get("clientmts_dayoff_policy", "none"),
+        "nationality_preference": r.get("clientmts_nationality_preference", "any"),
+        "living_arrangement":     r.get("clientmts_living_arrangement", "unspecified"),
+        "cuisine_preference":     r.get("clientmts_cuisine_preference", "other"),
     }
 
-# “Matching types” helpers
-client_cols = [c for c in df_work.columns if c.startswith("clientmts_")]
-maid_cols_mts   = [c for c in df_work.columns if c.startswith("maidmts_")]
-maid_cols_pref  = [c for c in df_work.columns if c.startswith("maidpref_")]
+def _maid_types_from_row(r: dict) -> dict:
+    return {
+        "household_type":     r.get("maidmts_household_type", "none"),
+        "pet_type":           r.get("maidmts_pet_type", "none"),
+        "dayoff_policy":      r.get("maidmts_dayoff_policy", "unspecified"),
+        "living_arrangement": r.get("maidmts_living_arrangement", "unspecified"),
+        "education":          r.get("maidpref_education", "not_specified"),
+        "kids_experience":    r.get("maidpref_kids_experience", "none"),
+        "pet_handling":       r.get("maidpref_pet_handling", "none"),
+        "personality":        r.get("maidpref_personality", "not_mentioned"),
+        "travel":             r.get("maidpref_travel", "no"),
+        "smoking":            r.get("maidpref_smoking", "unspecified"),
+        "caregiving_profile": r.get("maidpref_caregiving_profile", "none"),
+    }
 
-def _types_row(client_id: str, maid_id: str) -> dict:
-    # Grab any row for this client-maid to display engineered types
-    row = df_work[(df_work["client_name"]==client_id) & (df_work["maid_id"]==maid_id)]
-    if row.empty:
-        return {"client": {}, "maid": {}}
-    r = row.iloc[0]
-    client_types = {c: r[c] for c in client_cols if pd.notna(r.get(c))}
-    maid_types   = {c: r[c] for c in (maid_cols_mts + maid_cols_pref) if pd.notna(r.get(c))}
-    return {"client": client_types, "maid": maid_types}
+def _fmt_types(d: dict) -> str:
+    return ", ".join([f"{k}: {v}" for k, v in d.items()])
 
-# ---------- 5) Build the score matrix ----------
-clients_use = clients[:]
-maids_use   = maids[:]
-if max_pairs and max_pairs > 0:
-    clients_use = clients_use[:max_pairs]
-    maids_use   = maids_use[:max_pairs] if len(maids_use) >= max_pairs else maids_use
+# -------------------------
+# Scoring mix & constraints
+# -------------------------
+st.subheader("Scoring mix & constraints")
 
-nC, nM = len(clients_use), len(maids_use)
-if nC == 0 or nM == 0:
-    st.warning("Not enough clients or maids to build an assignment.")
-    st.stop()
+cA, cB, cC = st.columns([1.2, 1.4, 1])
+with cA:
+    model_score_weight = st.slider(
+        "Weight: model score (0–1)",
+        min_value=0.0, max_value=1.0, step=0.05, value=1.0
+    )
+with cB:
+    penalty_per_theme = st.slider(
+        "Penalty per overlapping theme",
+        min_value=-15.0, max_value=0.0, step=1.0, value=-8.0
+    )
+with cC:
+    cap_total_penalty = st.slider(
+        "Cap: total theme penalty",
+        min_value=-50.0, max_value=0.0, step=1.0, value=-25.0
+    )
 
-# Create matrix of composite scores; fill with very low scores for missing combos
-S = np.zeros((nC, nM), dtype=float)
-meta = [[None for _ in range(nM)] for __ in range(nC)]  # keep reasons & types
+cD, cE = st.columns([1, 1])
+with cD:
+    max_clients_to_assign = st.number_input(
+        "Max clients to assign (0 = all)",
+        min_value=0, value=0, step=1
+    )
+with cE:
+    greedy_note = st.info("SciPy not available — using greedy assignment fallback.")
 
-for i, cid in enumerate(clients_use):
-    for j, mid in enumerate(maids_use):
-        base = row_lookup.get((cid, mid), {"base": 0.0, "notes": "", "decision": ""})
-        base_score = base["base"]
-        # Theme penalty
-        t_pen, t_overlap = theme_adjustment(cid, mid)
-        composite = base_weight * base_score + (t_pen)  # t_pen is negative or zero
+# Load theme maps (safe if uploaders are empty)
+client_theme_map = _load_theme_map(client_themes_json, "client_name")
+maid_theme_map   = _load_theme_map(maid_themes_json,   "maid_id")
 
-        S[i, j] = composite
-        meta[i][j] = {
-            "client": cid, "maid": mid,
-            "base": base_score, "composite": composite,
-            "theme_pen": t_pen, "overlaps": t_overlap,
-            "notes": base["notes"], "decision": base["decision"],
-            "types": _types_row(cid, mid),
-        }
+# -------------------------
+# Build candidates + theme cols
+# -------------------------
+candidates = work.copy()
 
-# ---------- 6) Solve assignment (maximize S) ----------
-assign_info = []
-try:
-    # Hungarian solves min-cost; convert by negating
-    from scipy.optimize import linear_sum_assignment
-    cost = -S
-    ri, cj = linear_sum_assignment(cost)
-    for i, j in zip(ri, cj):
-        assign_info.append(meta[i][j])
-except Exception:
-    # Fallback: greedy (still reasonable for small sets)
-    st.warning("SciPy not available — using greedy assignment fallback.")
-    seenC, seenM = set(), set()
-    # rank all pairs by composite desc
-    pairs = []
-    for i in range(nC):
-        for j in range(nM):
-            pairs.append((S[i, j], i, j))
-    pairs.sort(reverse=True, key=lambda x: x[0])
-    for score, i, j in pairs:
-        if i in seenC or j in seenM:
+# theme_overlap / theme_penalty
+def _theme_cols(row):
+    olap, pen = compute_theme_overlap_penalty(
+        row.get("client_name"),
+        row.get("maid_id"),
+        client_theme_map,
+        maid_theme_map,
+        penalty_per_theme=penalty_per_theme,
+        cap_total=cap_total_penalty,
+    )
+    return pd.Series([olap, pen], index=["theme_overlap", "theme_penalty"])
+
+candidates[["theme_overlap","theme_penalty"]] = candidates.apply(_theme_cols, axis=1)
+
+# Pretty types (merge from engineered_df if needed)
+needed_client_cols = {
+    "clientmts_household_type","clientmts_special_cases","clientmts_pet_type",
+    "clientmts_dayoff_policy","clientmts_nationality_preference",
+    "clientmts_living_arrangement","clientmts_cuisine_preference",
+}
+needed_maid_cols = {
+    "maidmts_household_type","maidmts_pet_type","maidmts_dayoff_policy","maidmts_living_arrangement",
+    "maidpref_education","maidpref_kids_experience","maidpref_pet_handling",
+    "maidpref_personality","maidpref_travel","maidpref_smoking","maidpref_caregiving_profile",
+}
+
+have_client_cols = needed_client_cols.issubset(candidates.columns)
+have_maid_cols   = needed_maid_cols.issubset(candidates.columns)
+
+if not (have_client_cols and have_maid_cols):
+    # bridge from engineered_df
+    if isinstance(df_engineered, pd.DataFrame) and not df_engineered.empty:
+        bridge_cols = list({"client_name","maid_id"} | needed_client_cols | needed_maid_cols)
+        bridge = df_engineered[bridge_cols].drop_duplicates(["client_name","maid_id"], keep="first")
+        candidates = candidates.merge(bridge, on=["client_name","maid_id"], how="left")
+
+candidates["client_types"] = candidates.apply(lambda r: _fmt_types(_client_types_from_row(r)), axis=1)
+candidates["maid_types"]   = candidates.apply(lambda r: _fmt_types(_maid_types_from_row(r)),   axis=1)
+
+# composite score
+candidates["composite_score"] = model_score_weight * candidates["model_score"].astype(float) + candidates["theme_penalty"].astype(float)
+
+# Explanation column if notes exist
+if "score_notes" in candidates.columns:
+    candidates["why_this_is_optimal"] = candidates["score_notes"].astype(str)
+else:
+    candidates["why_this_is_optimal"] = ""
+
+# -------------------------
+# Greedy assignment solver
+# -------------------------
+def greedy_assign(df: pd.DataFrame, max_clients=0):
+    df2 = df.sort_values(["composite_score","model_score"], ascending=False).copy()
+    used_maids   = set()
+    used_clients = set()
+    rows = []
+    for _, r in df2.iterrows():
+        c = r["client_name"]; m = r["maid_id"]
+        if c in used_clients or m in used_maids:
             continue
-        seenC.add(i); seenM.add(j)
-        assign_info.append(meta[i][j])
-        if len(seenC) >= min(nC, nM):
+        rows.append(r)
+        used_clients.add(c); used_maids.add(m)
+        if max_clients and len(used_clients) >= max_clients:
             break
+    if not rows:
+        return pd.DataFrame(columns=df.columns)
+    return pd.DataFrame(rows)
 
-# ---------- 7) Display results ----------
-def _pill(text, bg="#263238"):
-    return f'<span style="padding:3px 8px;border-radius:12px;background:{bg};color:#fff;font-size:12px;margin-right:6px">{text}</span>'
+suggested = greedy_assign(candidates, max_clients=max_clients_to_assign)
 
 st.subheader("Suggested assignments (optimal set)")
-rows_for_df = []
-for a in assign_info:
-    overlaps = ", ".join(a["overlaps"]) if a["overlaps"] else "—"
-    # concise reasons: keep the core ‘score_notes’ and theme blurb
-    reason_bits = []
-    if a["notes"]:
-        reason_bits.append(a["notes"])
-    if a["overlaps"]:
-        reason_bits.append(f"Theme risk overlap: {overlaps}")
-    reason = " | ".join(reason_bits)
-
-    # matching types (short)
-    ct = a["types"]["client"]; mt = a["types"]["maid"]
-    ct_show = ", ".join([f"{k.replace('clientmts_','')}: {v}" for k,v in ct.items() if isinstance(v,str) and v not in ("none","unspecified","not_specified")])
-    mt_show = ", ".join([f"{k.replace('maidmts_','').replace('maidpref_','')}: {v}" for k,v in mt.items() if isinstance(v,str) and v not in ("none","unspecified","not_specified")])
-
-    rows_for_df.append({
-        "client_name": a["client"],
-        "maid_id": a["maid"],
-        "composite_score": round(a["composite"], 1),
-        "model_score": round(a["base"], 1),
-        "theme_penalty": a["theme_pen"],
-        "decision": a["decision"],
-        "theme_overlap": overlaps,
-        "client_types": ct_show or "—",
-        "maid_types": mt_show or "—",
-        "why_this_is_optimal": reason or "—",
-    })
-
-assign_df = pd.DataFrame(rows_for_df).sort_values("composite_score", ascending=False)
-
-# Color style
-def _color_score(val):
-    if pd.isna(val): return ""
-    # green high, red low
-    v = float(val)
-    if v >= 85:  color = "#2e7d32"
-    elif v >= 70: color = "#388e3c"
-    elif v >= 55: color = "#558b2f"
-    elif v >= 40: color = "#8e24aa"  # mid
-    else:         color = "#c62828"
-    return f"background-color:{color};color:white"
-
-st.dataframe(
-    assign_df.style.applymap(_color_score, subset=["composite_score"]).format(
-        {"composite_score": "{:.1f}", "model_score": "{:.1f}"}
-    ),
-    use_container_width=True,
-    hide_index=True
-)
+show_cols = [
+    "client_name","maid_id","composite_score","model_score","theme_penalty",
+    "decision","theme_overlap","client_types","maid_types","why_this_is_optimal"
+]
+for col in show_cols:
+    if col not in suggested.columns:
+        suggested[col] = ""
+st.dataframe(suggested[show_cols], use_container_width=True, hide_index=True)
 
 # Download
-st.download_button(
-    "⬇️ Download assignments CSV",
-    data=assign_df.to_csv(index=False).encode("utf-8"),
-    file_name="optimal_assignments.csv",
-    mime="text/csv"
-)
+csv_bytes = suggested[show_cols].to_csv(index=False).encode("utf-8")
+st.download_button("⬇️ Download assignments CSV", data=csv_bytes, file_name="suggested_assignments.csv", mime="text/csv")
 
-# ---------- 8) Inspect any pair ad-hoc ----------
+# -------------------------
+# Explain a specific pair
+# -------------------------
 st.subheader("Explain a specific pair")
-cc1, cc2 = st.columns(2)
-with cc1:
-    pick_client = st.selectbox("Client", clients_use, key="explain_client")
-with cc2:
-    pick_maid = st.selectbox("Maid", maids_use, key="explain_maid")
 
-# Find the meta for this pair
-ex = None
-try:
-    i = clients_use.index(pick_client); j = maids_use.index(pick_maid)
-    ex = meta[i][j]
-except Exception:
-    pass
+left, right = st.columns([1,1])
+with left:
+    sel_client = st.selectbox("Client", sorted(work["client_name"].unique().tolist()))
+with right:
+    # only maids that appear with that client anywhere in data (fallback to all)
+    subset_maids = work.loc[work["client_name"]==sel_client, "maid_id"].unique().tolist()
+    if not subset_maids:
+        subset_maids = sorted(work["maid_id"].unique().tolist())
+    sel_maid = st.selectbox("Maid", sorted(map(str, subset_maids)))
 
-if ex:
-    st.write(
-        f"**Composite**: {ex['composite']:.1f}  "
-        f"• **Model**: {ex['base']:.1f}  "
-        f"• **Theme penalty**: {ex['theme_pen']}  "
-        f"• **Decision**: {ex['decision']}"
-    )
-    if ex["overlaps"]:
-        st.warning("Theme overlaps: " + ", ".join(ex["overlaps"]))
+pair_row = candidates[
+    (candidates["client_name"] == str(sel_client)) &
+    (candidates["maid_id"]     == str(sel_maid))
+].sort_values("composite_score", ascending=False).head(1)
+
+if pair_row.empty:
+    st.info("This client–maid pair doesn’t exist in the current table.")
+else:
+    r = pair_row.iloc[0]
+    comp = float(r.get("composite_score", 0))
+    mod  = float(r.get("model_score", 0))
+    pen  = float(r.get("theme_penalty", 0))
+    dec  = r.get("decision","")
+    st.write(f"**Composite:** {comp:.1f} • **Model:** {mod:.1f} • **Theme penalty:** {pen:.1f} • **Decision:** {dec}")
+
+    overlap = r.get("theme_overlap") or []
+    if overlap:
+        st.info("Theme overlaps: " + ", ".join(overlap))
     else:
-        st.info("No theme risk overlaps detected.")
+        st.success("No theme risk overlaps detected.")
 
-    cL, cR = st.columns(2)
-    with cL:
-        st.caption("Client matching types")
-        st.json(ex["types"]["client"])
-    with cR:
-        st.caption("Maid matching types")
-        st.json(ex["types"]["maid"])
+    st.caption("Client matching types")
+    st.json(_client_types_from_row(r))
 
-    if ex["notes"]:
-        st.caption("Model notes (why):")
-        st.write(ex["notes"])
+    st.caption("Maid matching types")
+    st.json(_maid_types_from_row(r))
