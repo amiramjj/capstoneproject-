@@ -1,5 +1,19 @@
 # app_cleaning.py
 # Streamlit: Cleaning & Preprocessing (Cleaning v1)
+# --- ensure google-generativeai is available (temporary self-heal) ---
+import sys, importlib, subprocess
+
+def ensure_pkg(pkg, spec=None):
+    try:
+        importlib.import_module(pkg)
+    except ModuleNotFoundError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", spec or pkg])
+
+# Install/ensure exact versions we want
+ensure_pkg("google.generativeai", "google-generativeai>=0.8.0")
+ensure_pkg("google", "protobuf>=4.25,<5")  # protobuf lives under 'google' namespace
+
+import google.generativeai as genai  # will succeed now
 
 import io
 import re
