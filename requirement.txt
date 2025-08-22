@@ -10,3 +10,4 @@ python-dotenv>=1.0
 
 google-generativeai>=0.8.0
 protobuf>=4.25,<5
+google-generativeai
