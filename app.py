@@ -1352,13 +1352,6 @@ from collections import Counter
 
 import pandas as pd
 import streamlit as st
-import importlib.metadata as md, streamlit as st
-try:
-    st.write("google-generativeai", md.version("google-generativeai"))
-    st.write("protobuf", md.version("protobuf"))
-except md.PackageNotFoundError as e:
-    st.warning(f"Not installed: {e}")
-
 
 # ---- Try to import Gemini SDK; show a helpful message if missing ----
 try:
