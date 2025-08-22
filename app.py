@@ -1885,6 +1885,7 @@ import math
 import numpy as np
 import pandas as pd
 import streamlit as st
+import re  # <-- added
 
 st.markdown("---")
 st.header("Auto-Assignment (Themes ✕ Matching Score)")
@@ -1919,6 +1920,11 @@ with c1:
     client_json_file = st.file_uploader("Client themes JSON", type=["json"], key="client_themes_json_up")
 with c2:
     maid_json_file = st.file_uploader("Maid themes JSON", type=["json"], key="maid_themes_json_up")
+
+# ---- NEW: canonicalize theme tokens so overlaps collide reliably ----
+def _norm_theme(s) -> str:
+    """Normalize theme tokens (lowercase, non-alnum -> underscore, trim)."""
+    return re.sub(r"[^a-z0-9]+", "_", str(s).lower()).strip("_")
 
 def _load_theme_map(file, entity_key: str) -> dict[str, dict[str, int]]:
     """
@@ -2038,14 +2044,15 @@ def _load_theme_map(file, entity_key: str) -> dict[str, dict[str, int]]:
                     all_themes.extend(v)
 
             for t in all_themes:
-                t = str(t).strip().lower()
+                t = _norm_theme(t)  # <-- normalized (was: str(t).strip().lower())
                 if not t:
                     continue
                 counter[t] = counter.get(t, 0) + 1
 
-        theme_map[str(ent_id)] = counter
+        theme_map[str(ent_id).strip()] = counter  # <-- strip IDs when storing
 
     return theme_map
+
 client_theme_map = _load_theme_map(client_json_file, "client_name")
 maid_theme_map   = _load_theme_map(maid_json_file, "maid_id")
 
@@ -2094,8 +2101,8 @@ def theme_adjustment(client_id: str, maid_id: str) -> tuple[int, list]:
       - what others have complained about this maid
     Returns (penalty_int, list_of_overlaps)
     """
-    cbag = client_theme_map.get(client_id, {})
-    mbag = maid_theme_map.get(maid_id, {})
+    cbag = client_theme_map.get(str(client_id).strip(), {})
+    mbag = maid_theme_map.get(str(maid_id).strip(), {})
     if not cbag or not mbag:
         return 0, []
 
@@ -2130,14 +2137,31 @@ client_cols = [c for c in df_work.columns if c.startswith("clientmts_")]
 maid_cols_mts   = [c for c in df_work.columns if c.startswith("maidmts_")]
 maid_cols_pref  = [c for c in df_work.columns if c.startswith("maidpref_")]
 
+# ---- UPDATED: more defensive (populates JSON boxes reliably) ----
 def _types_row(client_id: str, maid_id: str) -> dict:
-    # Grab any row for this client-maid to display engineered types
-    row = df_work[(df_work["client_name"]==client_id) & (df_work["maid_id"]==maid_id)]
-    if row.empty:
+    # Match on string + strip to avoid subtle whitespace mismatches
+    df_pair = df_work[
+        (df_work["client_name"].astype(str).str.strip() == str(client_id).strip()) &
+        (df_work["maid_id"].astype(str).str.strip()     == str(maid_id).strip())
+    ]
+    if df_pair.empty:
         return {"client": {}, "maid": {}}
-    r = row.iloc[0]
-    client_types = {c: r[c] for c in client_cols if pd.notna(r.get(c))}
-    maid_types   = {c: r[c] for c in (maid_cols_mts + maid_cols_pref) if pd.notna(r.get(c))}
+
+    r = df_pair.iloc[0]
+
+    def _grab(cols):
+        out = {}
+        for c in cols:
+            if c in r.index:
+                v = r[c]
+                if pd.notna(v):
+                    vs = str(v).strip()
+                    if vs and vs not in ("none", "unspecified", "not_specified"):
+                        out[c] = vs
+        return out
+
+    client_types = _grab(client_cols)
+    maid_types   = _grab(maid_cols_mts + maid_cols_pref)
     return {"client": client_types, "maid": maid_types}
 
 # ---------- 5) Build the score matrix ----------
