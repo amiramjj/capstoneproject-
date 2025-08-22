@@ -1920,36 +1920,131 @@ with c1:
 with c2:
     maid_json_file = st.file_uploader("Maid themes JSON", type=["json"], key="maid_themes_json_up")
 
-def _load_theme_map(file, entity_key):
+def _load_theme_map(file, entity_key: str) -> dict[str, dict[str, int]]:
     """
-    Expecting a structure like:
-      {
-        "client0055": [{"all_case_themes":[...],"subcategory_themes":[...], ...}, ...],
-        ...
-      }
-    or the maid equivalent keyed by maid_id.
-    We collapse into: id -> Counter-like dict of theme frequencies.
+    Robustly load your themes JSON and return:
+        { <entity_id>: { <theme>: frequency, ... }, ... }
+
+    Accepts shapes:
+      1) { "<id>": [ {all_case_themes:[], subcategory_themes:[]}, ... ], ... }
+      2) { "clients" | "maids" | "entities": [...] }  (unwraps)
+      3) [ {client_name/maid_id: "...", all_case_themes:[], subcategory_themes:[]}, ... ]
+      4) rows using keys 'themes'/'subcats'/'subcategories' instead of 'all_case_themes'/'subcategory_themes'
     """
     if not file:
         return {}
+
+    import json
+    file.seek(0)
     raw = json.loads(file.read().decode("utf-8"))
-    theme_map = {}
-    for ent_id, rows in raw.items():
-        counter = {}
-        for r in rows or []:
+
+    # ---- unify into a mapping: id -> list_of_rows ----
+    mapping = None
+
+    if isinstance(raw, dict):
+        # unwrap common wrappers
+        if "clients" in raw and isinstance(raw["clients"], (dict, list)):
+            mapping = raw["clients"]
+        elif "maids" in raw and isinstance(raw["maids"], (dict, list)):
+            mapping = raw["maids"]
+        elif "entities" in raw and isinstance(raw["entities"], list):
+            # e.g. {"entities":[{"id": "...", "rows":[...]}, ...]}
+            mapping = {}
+            for e in raw["entities"]:
+                if not isinstance(e, dict):
+                    continue
+                k = str(
+                    e.get("id")
+                    or e.get(entity_key)
+                    or e.get("client_name")
+                    or e.get("maid_id")
+                    or ""
+                )
+                if not k:
+                    continue
+                rows = e.get("rows") or e.get("items") or e.get("complaints") or []
+                if isinstance(rows, dict):
+                    rows = [rows]
+                if not isinstance(rows, list):
+                    rows = []
+                mapping[k] = rows
+        else:
+            # Could already be {id: [rows], ...}
+            # Or {id: {single_row}}, normalize single_row -> [single_row]
+            ok = True
+            for v in raw.values():
+                if not isinstance(v, (list, dict, type(None))):
+                    ok = False
+                    break
+            if ok:
+                mapping = {}
+                for k, v in raw.items():
+                    if v is None:
+                        rows = []
+                    elif isinstance(v, dict):
+                        rows = [v]
+                    elif isinstance(v, list):
+                        rows = v
+                    else:
+                        rows = []
+                    mapping[str(k)] = rows
+
+    if mapping is None and isinstance(raw, list):
+        # list of row objects → group by entity_key
+        mapping = {}
+        for r in raw:
+            if not isinstance(r, dict):
+                continue
+            k = str(
+                r.get(entity_key)
+                or r.get("id")
+                or r.get("client_name")
+                or r.get("maid_id")
+                or ""
+            )
+            if not k:
+                continue
+            mapping.setdefault(k, []).append(r)
+
+    if mapping is None:
+        # Unknown shape → treat as empty
+        return {}
+
+    # ---- collapse to id -> Counter(theme) ----
+    theme_map: dict[str, dict[str, int]] = {}
+    for ent_id, rows in mapping.items():
+        # sanitize rows
+        if rows is None:
+            rows = []
+        if isinstance(rows, dict):
+            rows = [rows]
+        if not isinstance(rows, list):
+            rows = []
+
+        counter: dict[str, int] = {}
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+
+            # accept both naming conventions
             all_themes = []
-            if isinstance(r, dict):
-                all_themes += r.get("all_case_themes", []) or []
-                all_themes += r.get("subcategory_themes", []) or []
-            elif isinstance(r, list):
-                # if someone exported only arrays
-                all_themes += r
+            for key in ("all_case_themes", "themes", "all_themes"):
+                v = r.get(key)
+                if isinstance(v, list):
+                    all_themes.extend(v)
+            for key in ("subcategory_themes", "subcats", "subcategories"):
+                v = r.get(key)
+                if isinstance(v, list):
+                    all_themes.extend(v)
+
             for t in all_themes:
                 t = str(t).strip().lower()
-                if not t: 
+                if not t:
                     continue
                 counter[t] = counter.get(t, 0) + 1
+
         theme_map[str(ent_id)] = counter
+
     return theme_map
 
 client_theme_map = _load_theme_map(client_json_file, "client_name")
