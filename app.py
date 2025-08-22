@@ -1402,23 +1402,45 @@ def _hash_key(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
 @st.cache_data(show_spinner=False, ttl=60*60*24)
-def extract_themes_cached(system_prompt: str, text: str):
+def extract_themes_cached(system_prompt: str, complaint_text: str, return_raw: bool=False):
     """
-    Cached wrapper around your Gemini extractor, with summarize fallback.
-    Keyed by (prompt_hash, text_hash) so repeated runs are free.
+    Call Gemini extractor with a safe fallback.
+    - Uses summarize→extract only if call_gemini_summarize is available.
+    - Always returns dict: {"themes": [...], "subcats": [...]} (and "raw" if return_raw=True)
     """
-    key = _hash_key((system_prompt or "").strip() + "||" + (text or ""))
-    # Invoke Gemini (re-using your functions)
+    system_prompt = (system_prompt or "").strip()
+    txt = (complaint_text or "").strip()
+
+    # Skip obvious non-signal rows
+    if not txt or txt.lower() == "no complaint":
+        out = {"all_case_themes": [], "subcategory_themes": []}
+        res = {"themes": [], "subcats": []}
+        if return_raw: res["raw"] = out
+        return res
+
+    # Primary attempt
     try:
-        out, _ = call_gemini_extract(system_prompt.strip(), text.strip())
+        out, _raw = call_gemini_extract(system_prompt, txt)
     except Exception:
-        # summarize → extract fallback
-        sm = call_gemini_summarize(text.strip())
-        out, _ = call_gemini_extract(system_prompt.strip(), sm or text.strip())
-    # Normalize to lists of strings
-    themes = [str(t).strip() for t in (out.get("all_case_themes") or []) if str(t).strip()]
+        # Optional fallback if the summarizer exists
+        summarize_fn = globals().get("call_gemini_summarize", None)
+        if callable(summarize_fn):
+            try:
+                sm = summarize_fn(txt) or txt
+                out, _raw = call_gemini_extract(system_prompt, sm)
+            except Exception:
+                out, _raw = {"all_case_themes": [], "subcategory_themes": []}, ""
+        else:
+            out, _raw = {"all_case_themes": [], "subcategory_themes": []}, ""
+
+    # Normalize
+    themes  = [str(t).strip() for t in (out.get("all_case_themes") or []) if str(t).strip()]
     subcats = [str(t).strip() for t in (out.get("subcategory_themes") or []) if str(t).strip()]
-    return {"themes": themes, "subcats": subcats, "cache_key": key}
+    res = {"themes": themes, "subcats": subcats}
+    if return_raw: res["raw"] = out
+    return res
+
+
 
 def _prep_subset(df: pd.DataFrame):
     s = df.copy()
