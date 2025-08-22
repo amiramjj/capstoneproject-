@@ -8,5 +8,5 @@ lightgbm>=4.3
 google-generativeai>=0.7.2
 python-dotenv>=1.0
 
-google-generativeai
-openpyxl
+google-generativeai>=0.8.0
+protobuf>=4.25,<5
