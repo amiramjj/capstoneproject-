@@ -1199,9 +1199,12 @@ def _make_pair_row(client_row: pd.Series, maid_row: pd.Series) -> pd.Series:
 st.markdown("---")
 st.header("Step 3B — Try a Client ↔︎ Maid Pair (interactive)")
 
-engineered_or_scored = (
-    st.session_state.get("scored_df") or
-    st.session_state.get("engineered_df")
+# Prefer scored_df if it exists, otherwise engineered_df
+df_scored = st.session_state.get("scored_df", None)
+df_engineered = st.session_state.get("engineered_df", None)
+
+engineered_or_scored = df_scored if isinstance(df_scored, pd.DataFrame) else (
+    df_engineered if isinstance(df_engineered, pd.DataFrame) else None
 )
 
 if engineered_or_scored is None:
