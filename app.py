@@ -1753,11 +1753,20 @@ def extract_full_cached(system_prompt: str, complaint_text: str):
 
 def _filter_df(df: pd.DataFrame) -> pd.DataFrame:
     s = df.copy()
-    s["complaint_summary"]  = s["complaint_summary"].astype(str).strip()
-    s["complaint_comments"] = s["complaint_comments"].astype(str).str.strip()
+
+    # Clean text columns robustly
+    s["complaint_summary"]  = (
+        s["complaint_summary"].fillna("").astype(str).str.strip()
+    )
+    s["complaint_comments"] = (
+        s["complaint_comments"].fillna("").astype(str).str.strip()
+    )
+
+    # Keep only rows with non-empty summaries (and optionally skip "no complaint")
     mask = s["complaint_summary"].ne("")
     if skip_no_complaint:
         mask &= s["complaint_summary"].str.lower().ne("no complaint")
+
     return s.loc[mask]
 
 def _build_json(df: pd.DataFrame, group_col: str, prompt: str, max_rows: int = 0, progress_label: str = ""):
