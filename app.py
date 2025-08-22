@@ -1351,6 +1351,15 @@ import json
 import time
 import pandas as pd
 import streamlit as st
+# before configuring or calling Gemini
+if not HAS_GENAI:
+    st.error("Gemini SDK (google-generativeai) is not installed. "
+             "Add `google-generativeai` to requirements.txt or pip install it.")
+    st.stop()
+
+# safe to use now
+genai.configure(api_key=ACTIVE_API_KEY)
+
 import google.generativeai as genai
 
 st.title("Complaint Themes Extractor")
