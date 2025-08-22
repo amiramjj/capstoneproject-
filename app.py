@@ -9,7 +9,6 @@ from statistics import mode, StatisticsError
 import numpy as np
 import pandas as pd
 import streamlit as st
-import google.generativeai as genai
 
 # ---- Keep data across button clicks ----
 for k in ("cleaned_df", "deduped_df", "engineered_df"):
