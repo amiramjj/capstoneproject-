@@ -832,3 +832,286 @@ if engineered_df_ss is not None:
 else:
     st.info("Run the first Feature Engineering step before Step 2B.")
 
+# ==============================
+# Step 3 — Matching Score (exact logic, with policies)
+# ==============================
+import re
+
+# ------ CONFIG (weights) ------
+WEIGHTS = {
+    "CAT_CONFLICT": -30,
+    "INFANT_CONFLICT": -35,
+    "INFANT_CONTRADICT": -25,
+    "DOG_CONFLICT": -20,
+    "MANYKIDS_CONFLICT": -20,
+    "AD_CONFLICT": -20,
+    "PRIVATE_ROOM_MISSING": -20,
+    "DAYOFF_MISMATCH": -10,
+    "NAT_PREF_MISS": -10,
+    "REQ_UNSPECIFIED_SOFT": -3,
+    "COOKING_MISSING_FLEX": -25,
+    "INFANT_SKILL": +10,
+    "MANYKIDS_SKILL": +5,
+    "PET_SKILL": +5,
+    "CUISINE_MATCH": +7,
+    "CAREGIVING_MATCH": +8,
+    "LANG_MATCH": +10,
+    "LANG_MISS": -20,
+    "PRIV_ROOM_FILIPINA": +10,
+    "SOFT_POS": +2,
+    "MOBILITY_2": +2,
+    "MOBILITY_1": +1,
+}
+
+# ------ helpers ------
+def _split_plus(s):
+    if pd.isna(s) or s is None:
+        return []
+    return [t.strip().lower() for t in str(s).split("+") if t.strip()]
+
+def _has_any(token_list, *candidates):
+    cand = set([c.lower() for c in candidates])
+    return any(t in cand for t in token_list)
+
+def _contains_word(s, word):
+    if pd.isna(s) or s is None: return False
+    return word in str(s).lower()
+
+def _expected_language(nat_group):
+    nat = (str(nat_group).lower() if pd.notna(nat_group) else "")
+    if nat in ("ethiopian",):
+        return "arabic"
+    if nat in ("filipina","indian","west_african"):
+        return "english"
+    return None
+
+def _normalize_nat_group(s):
+    if pd.isna(s) or s is None: return ""
+    x = str(s).lower()
+    if "filip" in x: return "filipina"
+    if "ethiop" in x: return "ethiopian"
+    if "west" in x and "afric" in x: return "west_african"
+    if "india" in x: return "indian"
+    return x
+
+def _client_nat_pref_set(s):
+    if pd.isna(s) or s is None: return set()
+    x = str(s).lower()
+    if "any" in x: return set()
+    prefs = set()
+    if re.search(r"filip", x): prefs.add("filipina")
+    if re.search(r"ethiop", x): prefs.add("ethiopian")
+    if re.search(r"west.*afric", x): prefs.add("west_african")
+    if re.search(r"india", x): prefs.add("indian")
+    return prefs
+
+def _lang_tokens(s):
+    if pd.isna(s) or s is None: return set()
+    return set([t.strip().lower() for t in str(s).replace("/", " ").replace(",", " ").split() if t.strip()])
+
+# ------ core scorer ------
+def score_pair(row, policy="balanced"):
+    notes = []
+    decision = "OK"
+    score = 50
+
+    # Client needs
+    cl_house = _split_plus(row.get("clientmts_household_type"))
+    cl_pets = _split_plus(row.get("clientmts_pet_type"))
+    cl_living = _split_plus(row.get("clientmts_living_arrangement"))
+    cl_dayoff = _split_plus(row.get("clientmts_dayoff_policy"))
+    cl_cuisines = [c for c in _split_plus(row.get("clientmts_cuisine_preference"))
+                   if c not in ("not_specified","unspecified","none","other")]
+    cl_natpref = _client_nat_pref_set(row.get("clientmts_nationality_preference"))
+    cl_special = _split_plus(row.get("clientmts_special_cases"))
+
+    client_has_baby = _has_any(cl_house, "baby","baby_and_kids")
+    client_has_manykids = _has_any(cl_house, "many_kids")
+    client_has_kids_over2 = client_has_manykids or _has_any(cl_house, "baby_and_kids")
+    client_has_cat = _has_any(cl_pets, "cat","both")
+    client_has_dog = _has_any(cl_pets, "dog","both")
+    client_in_AD = _has_any(cl_living, "abu_dhabi")
+    client_offers_pr = _has_any(cl_living, "private_room")
+    client_needs_dayoff_paid = _has_any(cl_dayoff, "work_for_pay","stay_home_for_pay")
+
+    # Maid facts (engineered)
+    infant_block = int(row.get("infant_block", 0)) == 1
+    infant_skill = int(row.get("infant_skill", 0)) == 1
+    manykids_block = int(row.get("manykids_block", 0)) == 1
+    manykids_skill = int(row.get("manykids_skill", 0)) == 1
+    cats_block = int(row.get("cats_block", 0)) == 1
+    dogs_block = int(row.get("dogs_block", 0)) == 1
+    cats_skill = int(row.get("cats_skill", 0)) == 1
+    dogs_skill = int(row.get("dogs_skill", 0)) == 1
+    avoids_ad = int(row.get("avoids_abudhabi", 0)) == 1
+    requires_pr = int(row.get("requires_private_room", 0)) == 1
+    dayoff_flexible = int(row.get("dayoff_flexible", 0)) == 1
+    dayoff_sunday_only = int(row.get("dayoff_sunday_only", 0)) == 1
+
+    non_smoker = int(row.get("maid_non_smoker_flag", 0)) == 1
+    energetic = int(row.get("energetic", 0)) == 1
+    no_attitude = int(row.get("no_attitude", 0)) == 1
+    no_tiktok = int(row.get("no_tiktok", 0)) == 1
+    veg_friendly = int(row.get("veg_friendly", 0)) == 1
+
+    elderly_ok = int(row.get("elderly_ok", 0)) == 1
+    special_ok = int(row.get("special_ok", 0)) == 1
+
+    mobility_flex = int(row.get("mobility_flex", 0)) if pd.notna(row.get("mobility_flex")) else 0
+
+    maid_cooking = str(row.get("cooking_details") or "").lower().strip()
+    maid_langs = _lang_tokens(row.get("maid_speaks_language"))
+    maid_nat = _normalize_nat_group(row.get("maid_grouped_nationality"))
+
+    # Hard gates
+    if policy in ("strict","balanced"):
+        if client_has_cat and cats_block:
+            return 0, "BLOCK", "cats_block + cat_in_home"
+        if client_has_baby and infant_block and (policy=="strict" or not infant_skill):
+            return 0, "BLOCK", "infant_block + baby_in_home"
+        if cl_cuisines:
+            has_any_cuisine = (maid_cooking in cl_cuisines)
+            if not has_any_cuisine:
+                return 0, "BLOCK", "cooking_missing"
+
+    # Big frictions
+    any_big = False
+
+    if client_has_baby and infant_block and infant_skill and policy in ("balanced","flexible"):
+        score += WEIGHTS["INFANT_CONTRADICT"]; any_big = True; notes.append("infant_block+skill_confirm")
+
+    if policy == "flexible" and client_has_cat and cats_block:
+        score += WEIGHTS["CAT_CONFLICT"]; any_big = True; notes.append("cats_block + cat_in_home")
+
+    if policy == "flexible" and client_has_baby and infant_block and not infant_skill:
+        score += WEIGHTS["INFANT_CONFLICT"]; any_big = True; notes.append("infant_block + baby_in_home")
+
+    if client_has_dog and dogs_block:
+        score += WEIGHTS["DOG_CONFLICT"]; any_big = True; notes.append("dogs_block + dog_in_home")
+
+    if client_has_manykids and manykids_block:
+        score += WEIGHTS["MANYKIDS_CONFLICT"]; any_big = True; notes.append("manykids_block + many_kids_in_home")
+
+    if client_in_AD and avoids_ad:
+        score += WEIGHTS["AD_CONFLICT"]; any_big = True; notes.append("ad_avoid + client_in_AD")
+
+    if requires_pr and not client_offers_pr:
+        pr_penalty = WEIGHTS["PRIVATE_ROOM_MISSING"] - 5 if maid_nat == "filipina" else WEIGHTS["PRIVATE_ROOM_MISSING"]
+        score += pr_penalty; any_big = True; notes.append("private_room_required_missing")
+
+    if client_needs_dayoff_paid and not dayoff_flexible:
+        score += WEIGHTS["DAYOFF_MISMATCH"]; any_big = True; notes.append("dayoff_mismatch")
+
+    if policy == "flexible" and cl_cuisines:
+        has_any_cuisine = (maid_cooking in cl_cuisines)
+        if not has_any_cuisine:
+            score += WEIGHTS["COOKING_MISSING_FLEX"]; any_big = True; notes.append("cooking_missing")
+
+    if cl_natpref:
+        if maid_nat not in cl_natpref:
+            score += WEIGHTS["NAT_PREF_MISS"]; any_big = True; notes.append("client_nat_pref_miss")
+
+    # Capability bonuses
+    if client_has_baby and infant_skill:
+        score += WEIGHTS["INFANT_SKILL"]; notes.append("infant_skill_ok")
+    if client_has_kids_over2 and manykids_skill:
+        score += WEIGHTS["MANYKIDS_SKILL"]; notes.append("kids_over2_skill_ok")
+    if client_has_cat and cats_skill:
+        score += WEIGHTS["PET_SKILL"]; notes.append("cats_handling_ok")
+    if client_has_dog and dogs_skill:
+        score += WEIGHTS["PET_SKILL"]; notes.append("dogs_handling_ok")
+
+    if cl_cuisines:
+        if maid_cooking == "not_specified" or maid_cooking in ("unspecified","none","other",""):
+            score += WEIGHTS["REQ_UNSPECIFIED_SOFT"]; notes.append("cuisine_unspecified_confirm")
+        else:
+            if maid_cooking in cl_cuisines:
+                score += WEIGHTS["CUISINE_MATCH"]; notes.append(f"cuisine_{maid_cooking}_ok")
+
+    if _has_any(cl_special, "elderly") and elderly_ok:
+        score += WEIGHTS["CAREGIVING_MATCH"]; notes.append("elderly_ok")
+    if _has_any(cl_special, "special_needs") and special_ok:
+        score += WEIGHTS["CAREGIVING_MATCH"]; notes.append("special_needs_ok")
+
+    exp_lang = _expected_language(maid_nat)
+    if exp_lang:
+        if exp_lang in maid_langs:
+            score += WEIGHTS["LANG_MATCH"]; notes.append(f"language_{exp_lang}_ok")
+        else:
+            score += WEIGHTS["LANG_MISS"]; any_big = True; notes.append(f"language_{exp_lang}_missing")
+
+    if maid_nat == "filipina" and client_offers_pr:
+        score += WEIGHTS["PRIV_ROOM_FILIPINA"]; notes.append("private_room_bonus_filipina")
+
+    if cl_natpref and maid_nat in cl_natpref:
+        score += 5; notes.append("client_nat_pref_hit")
+
+    # Soft positives
+    SOFT_TRAIT_CAP = 6
+    soft_flags = [non_smoker, energetic, no_attitude, no_tiktok, veg_friendly]
+    soft_count = sum(1 for f in soft_flags if f)
+    soft_bonus = min(soft_count * WEIGHTS["SOFT_POS"], SOFT_TRAIT_CAP)
+    if soft_bonus:
+        score += soft_bonus; notes.append(f"soft_traits({soft_count})")
+
+    if mobility_flex == 2:
+        score += WEIGHTS["MOBILITY_2"]; notes.append("mobility_travel_and_relocate")
+    elif mobility_flex == 1:
+        score += WEIGHTS["MOBILITY_1"]; notes.append("mobility_travel_or_relocate")
+
+    # Decision / clamp
+    if any_big and decision != "BLOCK":
+        decision = "REVIEW"
+    score = max(0, min(100, score))
+    return score, decision, "; ".join(notes) if notes else ""
+
+def apply_matching_score(df, policy="balanced"):
+    out = df.copy()
+    results = out.apply(lambda r: score_pair(r, policy=policy), axis=1, result_type="expand")
+    out["match_score"] = results[0]
+    out["decision"] = results[1]
+    out["score_notes"] = results[2]
+    return out
+# ---- Step 3 trigger: Matching Score ----
+engineered_df_ss = st.session_state.get("engineered_df")
+
+st.markdown("---")
+st.header("Step 3 — Matching Score Calculation")
+
+if engineered_df_ss is None:
+    st.info("Run Feature Engineering (and Step 2B) first to enable matching score.")
+else:
+    policy = st.radio("Select policy", ["strict", "balanced", "flexible"], index=1, horizontal=True)
+    if st.button("⚖️ Compute Matching Scores"):
+        with st.spinner("Scoring pairs..."):
+            scored_df = apply_matching_score(engineered_df_ss, policy=policy)
+            st.session_state["scored_df"] = scored_df
+
+        st.success("Matching scores computed and saved to session.")
+        # Quick overview
+        c1, c2, c3 = st.columns(3)
+        with c1: st.metric("Avg score", f"{scored_df['match_score'].mean():.1f}")
+        with c2: st.metric("REVIEW count", int((scored_df['decision']=="REVIEW").sum()))
+        with c3: st.metric("BLOCK count", int((scored_df['decision']=="BLOCK").sum()))
+
+        # Distribution and table
+        st.bar_chart(scored_df["match_score"])
+        st.dataframe(scored_df[["match_score","decision","score_notes"]].head(15), use_container_width=True)
+
+        @st.cache_data
+        def _to_csv_scores(df_): return df_.to_csv(index=False).encode("utf-8")
+
+        st.download_button(
+            "⬇️ Download Scored CSV",
+            data=_to_csv_scores(scored_df),
+            file_name=f"scored_{policy}.csv",
+            mime="text/csv",
+        )
+
+# Optional: show last scored preview
+if st.session_state.get("scored_df") is not None:
+    st.markdown("### Latest matching score preview")
+    st.dataframe(
+        st.session_state["scored_df"][["match_score","decision","score_notes"]].head(10),
+        use_container_width=True
+    )
