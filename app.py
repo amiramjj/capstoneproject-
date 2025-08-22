@@ -1345,16 +1345,29 @@ else:
 # ==============================================
 # Client ↔ Maid Themes Explorer (self-contained)
 # ==============================================
-import html
-import json
+import json, html
 from collections import Counter
 
-import google.generativeai as genai
 import pandas as pd
 import streamlit as st
 
+# ---- Try to import Gemini SDK; show a helpful message if missing ----
+try:
+    import google.generativeai as genai
+    _HAS_GENAI = True
+except ModuleNotFoundError:
+    _HAS_GENAI = False
+
 st.markdown("---")
 st.header("Client ↔ Maid Themes Explorer")
+
+if not _HAS_GENAI:
+    st.error(
+        "The Google Gemini SDK (`google-generativeai`) is not installed.\n\n"
+        "Add these to your **requirements.txt** and redeploy:\n"
+        "`google-generativeai>=0.8.0` and `protobuf>=4.25,<5`."
+    )
+    st.stop()
 
 # ---------- Local Gemini settings (API key + prompt) ----------
 api_key_choice = st.radio("API key to use", ["primary", "alt"], horizontal=True)
@@ -1372,24 +1385,24 @@ system_prompt_local = st.text_area(
     height=180,
     help="Paste the exact instruction you used to extract themes/subcategories."
 )
-col_save, col_clear = st.columns([1,1])
-with col_save:
+
+c_save, c_clear = st.columns([1, 1])
+with c_save:
     if st.button("Save prompt for this session"):
         st.session_state["system_prompt"] = system_prompt_local.strip()
         st.success("Saved. The extractor below will use this prompt.")
-with col_clear:
+with c_clear:
     if st.button("Clear saved prompt"):
         st.session_state.pop("system_prompt", None)
         st.info("Cleared.")
 
 ACTIVE_PROMPT = (system_prompt_local or st.session_state.get("system_prompt", "")).strip()
 
-# ---------- Prefer a source DataFrame from session ----------
+# ---------- Pick an in-session DataFrame ----------
 df_scored     = st.session_state.get("scored_df")
 df_engineered = st.session_state.get("engineered_df")
 df_deduped    = st.session_state.get("deduped_df")
-# (optionally fall back to uploaded file stored as st.session_state["df"])
-df_uploaded   = st.session_state.get("df")
+df_uploaded   = st.session_state.get("df")  # optional fallback from Upload page
 
 df_source = next(
     (d for d in [df_scored, df_engineered, df_deduped, df_uploaded] if isinstance(d, pd.DataFrame)),
@@ -1397,7 +1410,7 @@ df_source = next(
 )
 
 if df_source is None or df_source.empty:
-    st.info("No data available. Run Cleaning/Engineering first (or upload a file in the Batch section).")
+    st.info("No data available. Run Cleaning/Engineering (or upload a file in the Batch section).")
     st.stop()
 
 required_cols = {"client_name", "maid_id", "complaint_summary", "complaint_comments"}
@@ -1410,12 +1423,12 @@ if missing:
 clients = sorted(df_source["client_name"].dropna().astype(str).unique().tolist())
 maids   = sorted(df_source["maid_id"].dropna().astype(str).unique().tolist())
 
-c1, c2, c3 = st.columns([2,2,1])
-with c1:
+col_client, col_maid, col_max = st.columns([2, 2, 1])
+with col_client:
     sel_client = st.selectbox("Choose client", options=clients, index=0)
-with c2:
+with col_maid:
     sel_maid = st.selectbox("Choose maid", options=maids, index=0)
-with c3:
+with col_max:
     max_rows_each = st.number_input("Max rows / section", min_value=1, value=50, step=10)
 
 # ---------- Helpers ----------
@@ -1428,7 +1441,6 @@ def _chip(text, kind="theme"):
         f'font-size:12px;white-space:nowrap;">{html.escape(str(text))}</span>'
     )
 
-# Use your global extractors if present; otherwise define minimal local ones
 def _parse_resp(resp):
     raw_text = getattr(resp, "text", None)
     if not raw_text and getattr(resp, "candidates", None):
@@ -1436,8 +1448,9 @@ def _parse_resp(resp):
         raw_text = "".join(getattr(p, "text", "") for p in parts)
     return raw_text or ""
 
+# Use your global extractors if present; otherwise define minimal local ones
 try:
-    _ = call_gemini_extract  # type: ignore
+    _ = call_gemini_extract  # defined elsewhere?
     _HAS_EXTERNAL_EXTRACT = True
 except Exception:
     _HAS_EXTERNAL_EXTRACT = False
@@ -1456,7 +1469,7 @@ if not _HAS_EXTERNAL_EXTRACT:
                     "all_case_themes":    {"type": "array", "items": {"type": "string"}},
                     "subcategory_themes": {"type": "array", "items": {"type": "string"}},
                 },
-                "required": ["all_case_themes","subcategory_themes"]
+                "required": ["all_case_themes", "subcategory_themes"]
             },
             "max_output_tokens": 512,
             "temperature": 0.2,
@@ -1473,7 +1486,7 @@ if not _HAS_EXTERNAL_EXTRACT:
         }, raw
 
 try:
-    _ = call_gemini_summarize  # type: ignore
+    _ = call_gemini_summarize  # defined elsewhere?
     _HAS_EXTERNAL_SUM = True
 except Exception:
     _HAS_EXTERNAL_SUM = False
@@ -1503,9 +1516,9 @@ if not _HAS_EXTERNAL_SUM:
         data = json.loads(raw or "{}")
         return data.get("summary", "").strip()
 
-@st.cache_data(show_spinner=False, ttl=60*60*24)
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def extract_themes_cached(system_prompt: str, text: str):
-    """Cache by args; uses summarize→extract fallback when needed."""
+    """Cache by args; summarize→extract fallback on error."""
     try:
         out, _ = call_gemini_extract(system_prompt, text)
         themes = [str(t).strip() for t in (out.get("all_case_themes") or []) if str(t).strip()]
@@ -1523,7 +1536,6 @@ def _prep_subset(df: pd.DataFrame):
     s["complaint_summary"]  = s["complaint_summary"].astype(str).str.strip()
     s["complaint_comments"] = s["complaint_comments"].astype(str).str.strip()
     mask = s["complaint_summary"].str.len().gt(0) & s["complaint_summary"].str.lower().ne("no complaint")
-    # sort newest first when tag_date exists
     if "tag_date" in s.columns:
         s["tag_date_str"] = pd.to_datetime(s["tag_date"], errors="coerce")
         s = s.sort_values("tag_date_str", ascending=False)
@@ -1535,8 +1547,8 @@ def _summarize_counts(rows):
     for r in rows:
         theme_counter.update(r["themes"])
         sub_counter.update(r["subcats"])
-    top_themes = pd.DataFrame(theme_counter.most_common(20), columns=["theme","count"])
-    top_subs   = pd.DataFrame(sub_counter.most_common(20), columns=["subcategory","count"])
+    top_themes = pd.DataFrame(theme_counter.most_common(20), columns=["theme", "count"])
+    top_subs   = pd.DataFrame(sub_counter.most_common(20), columns=["subcategory", "count"])
     return top_themes, top_subs
 
 def _render_rows(df_subset, section_title, system_prompt: str):
@@ -1562,7 +1574,7 @@ def _render_rows(df_subset, section_title, system_prompt: str):
             "themes":      res["themes"],
             "subcategories": res["subcats"],
         })
-        prog.progress(k/len(df_subset))
+        prog.progress(k / len(df_subset))
 
     out_df = pd.DataFrame(themed_rows)
 
@@ -1612,8 +1624,10 @@ def _render_rows(df_subset, section_title, system_prompt: str):
 client_subset = _prep_subset(df_source[df_source["client_name"].astype(str) == str(sel_client)])
 maid_subset   = _prep_subset(df_source[df_source["maid_id"].astype(str) == str(sel_maid)])
 pair_subset   = _prep_subset(
-    df_source[(df_source["client_name"].astype(str) == str(sel_client)) &
-              (df_source["maid_id"].astype(str) == str(sel_maid))]
+    df_source[
+        (df_source["client_name"].astype(str) == str(sel_client)) &
+        (df_source["maid_id"].astype(str) == str(sel_maid))
+    ]
 )
 
 st.write(
@@ -1622,11 +1636,8 @@ st.write(
 )
 
 if st.button("🧩 Extract themes for client, maid, and client→maid"):
-    # A) Client history
     _render_rows(client_subset, "Client history", ACTIVE_PROMPT)
-    # B) Maid history
     _render_rows(maid_subset, "Maid history", ACTIVE_PROMPT)
-    # C) Pair intersection
     st.subheader("Client → Maid (intersection)")
     if pair_subset.empty:
         st.info("This client has no complaint entries on the selected maid.")
