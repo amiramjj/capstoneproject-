@@ -1351,6 +1351,7 @@ import json
 import time
 import pandas as pd
 import streamlit as st
+
 # ---- Safe Gemini import (only for the Gemini sections) ----
 try:
     import google.generativeai as genai
@@ -1374,6 +1375,10 @@ if "GOOGLE_API_KEY" not in st.secrets:
     st.error("No GOOGLE_API_KEY in Secrets. Add it in the app’s Settings → Secrets.")
     st.stop()
 
+if not HAS_GENAI:
+    st.error("Package 'google-generativeai' is not installed. Add it to requirements and redeploy.")
+    st.stop()
+
 # 2) Configure SDK ---- API key selector (primary vs alt) ----
 key_choice = st.radio("API key to use", ["primary", "alt"], horizontal=True, key="api_key_choice")
 ACTIVE_API_KEY = (
@@ -1381,8 +1386,34 @@ ACTIVE_API_KEY = (
     if key_choice == "primary"
     else st.secrets.get("ALT_GOOGLE_API_KEY", st.secrets["GOOGLE_API_KEY"])
 )
-genai.configure(api_key=ACTIVE_API_KEY)
 MODEL_NAME = st.secrets.get("MODEL_NAME", "gemini-2.5-flash-lite")
+
+# --- version-safe Gemini init (works with old + new APIs) ---
+@st.cache_resource
+def _init_gemini(api_key: str, model_name: str):
+    """
+    Returns a factory 'make_model(system_instruction: str|None) -> GenerativeModel'
+    that works across google-generativeai versions (configure vs Client()).
+    """
+    client = None
+    try:
+        # Older/global style
+        genai.configure(api_key=api_key)
+    except AttributeError:
+        # Newer style (explicit client)
+        client = genai.Client(api_key=api_key)
+
+    def make_model(system_instruction: str | None = None):
+        kwargs = {"model_name": model_name}
+        if system_instruction:
+            kwargs["system_instruction"] = system_instruction
+        if client is not None:  # newer API path
+            kwargs["client"] = client
+        return genai.GenerativeModel(**kwargs)
+
+    return make_model
+
+make_gemini_model = _init_gemini(ACTIVE_API_KEY, MODEL_NAME)
 
 # 3) Inputs
 system_prompt = st.text_area(
@@ -1406,10 +1437,7 @@ def _parse_resp(resp):
 
 def call_gemini_extract(system_instruction: str, complaint_text: str):
     """Primary extractor: expects three fields."""
-    model = genai.GenerativeModel(
-        model_name=MODEL_NAME,
-        system_instruction=system_instruction
-    )
+    model = make_gemini_model(system_instruction)
     generation_config = {
         "response_mime_type": "application/json",
         "response_schema": {
@@ -1455,7 +1483,7 @@ def call_gemini_extract(system_instruction: str, complaint_text: str):
 
 def call_gemini_summarize(complaint_text: str) -> str:
     """Fallback: compress to core issues only, then we re-run extraction on the summary."""
-    model = genai.GenerativeModel(model_name=MODEL_NAME)
+    model = make_gemini_model(None)
     generation_config = {
         "response_mime_type": "application/json",
         "response_schema": {
