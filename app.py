@@ -1361,6 +1361,7 @@ with st.expander("System instruction used below (Gemini)", expanded=True):
         key="explorer_system_prompt",
     )
     save_prompt = st.checkbox("Save this prompt to session for reuse on other pages", value=True)
+    debug_mode = st.checkbox("Debug mode (show raw and counts)", value=False)
     if save_prompt:
         st.session_state["system_prompt"] = explorer_prompt.strip()
 
@@ -1403,6 +1404,28 @@ def _chip(text, kind="theme"):
 def _hash_key(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
+def _coerce_list(x):
+    """Be tolerant: allow list; JSON-string list; or comma/semicolon separated string."""
+    if x is None:
+        return []
+    if isinstance(x, list):
+        return [str(t).strip() for t in x if str(t).strip()]
+    s = str(x).strip()
+    if not s:
+        return []
+    # JSON array?
+    if s.startswith("[") and s.endswith("]"):
+        try:
+            import json
+            arr = json.loads(s)
+            if isinstance(arr, list):
+                return [str(t).strip() for t in arr if str(t).strip()]
+        except Exception:
+            pass
+    # fallback: split by common separators
+    parts = re.split(r"[;,|]+", s)
+    return [p.strip() for p in parts if p.strip()]
+
 @st.cache_data(show_spinner=False, ttl=60*60*24)
 def extract_themes_cached(system_prompt: str, complaint_text: str, return_raw: bool=False):
     """
@@ -1435,9 +1458,10 @@ def extract_themes_cached(system_prompt: str, complaint_text: str, return_raw: b
         else:
             out, _raw = {"all_case_themes": [], "subcategory_themes": []}, ""
 
-    # Normalize
-    themes  = [str(t).strip() for t in (out.get("all_case_themes") or []) if str(t).strip()]
-    subcats = [str(t).strip() for t in (out.get("subcategory_themes") or []) if str(t).strip()]
+    # Normalize (tolerate strings)
+    themes  = _coerce_list(out.get("all_case_themes"))
+    subcats = _coerce_list(out.get("subcategory_themes"))
+
     res = {"themes": themes, "subcats": subcats}
     if return_raw: res["raw"] = out
     return res
@@ -1473,9 +1497,12 @@ def _render_rows(df_subset, section_title, system_prompt: str):
 
     prog = st.progress(0.0)
     themed_rows = []
+    # for debug counts
+    with_themes = 0
+
     for k, (_, row) in enumerate(df_subset.iterrows(), start=1):
-        res = extract_themes_cached(system_prompt.strip(), str(row["complaint_summary"]))
-        themed_rows.append({
+        res = extract_themes_cached(system_prompt.strip(), str(row["complaint_summary"]), return_raw=debug_mode)
+        row_rec = {
             "client_name": row.get("client_name"),
             "maid_id":     row.get("maid_id"),
             "tag_date":    row.get("tag_date"),
@@ -1483,10 +1510,20 @@ def _render_rows(df_subset, section_title, system_prompt: str):
             "complaint_comments": row["complaint_comments"],
             "themes":  res.get("themes", []),
             "subcats": res.get("subcats", []),
-        })
+        }
+        if debug_mode:
+            row_rec["raw"] = res.get("raw", {})
+        if row_rec["themes"] or row_rec["subcats"]:
+            with_themes += 1
+        themed_rows.append(row_rec)
         prog.progress(k/len(df_subset))
 
     out_df = pd.DataFrame(themed_rows)
+
+    if debug_mode:
+        st.info(f"{with_themes} / {len(out_df)} rows produced at least one theme/subcategory.")
+        st.caption("First 3 raw responses")
+        st.json(out_df.head(3).to_dict(orient="records"))
 
     # Top terms
     top_themes, top_subs = _summarize_theme_counts(themed_rows)
