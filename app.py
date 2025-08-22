@@ -361,6 +361,9 @@ else:
 # Streamlit: Engineering (MTS → Features)
 # Mirrors your exact notebook logic
 # ==============================
+# After cleaning is done and deduped_df is available
+if st.button(" Run Feature Engineering (ERP Lists)"):
+    engineered_df = run_engineering(deduped_df)
 
 import pandas as pd
 import streamlit as st
