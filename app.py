@@ -1115,3 +1115,223 @@ if st.session_state.get("scored_df") is not None:
         st.session_state["scored_df"][["match_score","decision","score_notes"]].head(10),
         use_container_width=True
     )
+
+# ============================================
+# Helpers for interactive pair scoring (Step 3B)
+# ============================================
+
+def _grouped_nat_from_raw(x: str) -> str:
+    """Normalize maid nationality to the grouped tokens your scorer expects."""
+    if x is None or (isinstance(x, float) and pd.isna(x)): return ""
+    s = str(x).lower()
+    if "filip" in s: return "filipina"
+    if "ethiop" in s: return "ethiopian"
+    if "west" in s and "afric" in s: return "west_african"
+    if "india" in s: return "indian"
+    return s
+
+CLIENT_COLS = [
+    # What the scorer reads from the client side
+    "clientmts_household_type","clientmts_pet_type","clientmts_living_arrangement",
+    "clientmts_dayoff_policy","clientmts_cuisine_preference","clientmts_nationality_preference",
+    "clientmts_special_cases",
+    # optional id context
+    "client_name","contract_id","cc_type","tag_date","untag_date",
+]
+MAID_COLS = [
+    # Flags & traits produced by Step 2B that the scorer uses
+    "infant_block","infant_skill","manykids_block","manykids_skill",
+    "cats_block","cats_skill","dogs_block","dogs_skill",
+    "requires_private_room","avoids_abudhabi","mobility_flex",
+    "dayoff_flexible","dayoff_sunday_only",
+    "maid_non_smoker_flag","energetic","no_attitude","no_tiktok","veg_friendly",
+    "elderly_ok","special_ok",
+    # Text-ish fields read by the scorer
+    "cooking_details","maid_speaks_language",
+    # nationality (either grouped or raw to group now)
+    "maid_grouped_nationality","maid_nationality",
+    # optional id context
+    "maid_id"
+]
+
+def _latest_by(df: pd.DataFrame, key_col: str, ts_col: str = "tag_date") -> pd.DataFrame:
+    """Pick the latest row per key (by tag_date if present)."""
+    df2 = df.copy()
+    if ts_col in df2.columns:
+        df2[ts_col] = pd.to_datetime(df2[ts_col], errors="coerce")
+        # sort so last is latest
+        df2 = df2.sort_values([key_col, ts_col], ascending=[True, True])
+    # keep last occurrence per key
+    return df2.groupby(key_col, as_index=False).tail(1)
+
+def _make_pair_row(client_row: pd.Series, maid_row: pd.Series) -> pd.Series:
+    """Build a synthetic row combining client_* needs with maid_* capabilities."""
+    combined = {}
+
+    # bring client fields
+    for c in CLIENT_COLS:
+        if c in client_row.index:
+            combined[c] = client_row[c]
+
+    # bring maid fields
+    for c in MAID_COLS:
+        if c in maid_row.index:
+            combined[c] = maid_row[c]
+
+    # ensure ids reflect the selection
+    combined["client_name"] = client_row.get("client_name", combined.get("client_name"))
+    combined["maid_id"] = maid_row.get("maid_id", combined.get("maid_id"))
+
+    # guarantee a grouped nationality value for the scorer
+    mg = combined.get("maid_grouped_nationality")
+    if not mg:
+        combined["maid_grouped_nationality"] = _grouped_nat_from_raw(maid_row.get("maid_nationality"))
+
+    # default for cooking_details/langs (string-y)
+    combined["cooking_details"] = (str(combined.get("cooking_details") or "").strip().lower() or "not_specified")
+    if pd.isna(combined.get("maid_speaks_language")) or not str(combined.get("maid_speaks_language")).strip():
+        combined["maid_speaks_language"] = "not_specified"
+
+    return pd.Series(combined)
+# ==============================
+# Step 3B — Interactive Pair Scoring
+# ==============================
+st.markdown("---")
+st.header("Step 3B — Try a Client ↔︎ Maid Pair (interactive)")
+
+engineered_or_scored = (
+    st.session_state.get("scored_df") or
+    st.session_state.get("engineered_df")
+)
+
+if engineered_or_scored is None:
+    st.info("Run Feature Engineering (and Step 3) first to enable interactive pair scoring.")
+else:
+    dfE = engineered_or_scored.copy()
+
+    # Build selection sources (latest record per entity)
+    clients_latest = _latest_by(dfE, key_col="client_name")
+    maids_latest   = _latest_by(dfE, key_col="maid_id")
+
+    if clients_latest.empty or maids_latest.empty:
+        st.warning("Not enough data to build client/maid pickers.")
+    else:
+        c1, c2 = st.columns(2)
+        with c1:
+            sel_client = st.selectbox(
+                "Choose Client", 
+                options=sorted(clients_latest["client_name"].dropna().unique().tolist()),
+                index=0
+            )
+        with c2:
+            # Optional filters for maid picker
+            maid_filter_nat = st.selectbox(
+                "Filter maids by nationality (optional)",
+                options=["(all)"] + sorted(maids_latest.get("maid_nationality", pd.Series(dtype=str)).dropna().str.lower().unique().tolist()),
+                index=0
+            )
+
+            _maids_df = maids_latest
+            if maid_filter_nat != "(all)" and "maid_nationality" in _maids_df.columns:
+                _maids_df = _maids_df[_maids_df["maid_nationality"].str.lower() == maid_filter_nat]
+
+            sel_maid = st.selectbox(
+                "Choose Maid",
+                options=sorted(_maids_df["maid_id"].dropna().astype(str).unique().tolist()),
+                index=0
+            )
+
+        # Pull the rows
+        client_row = clients_latest[clients_latest["client_name"] == sel_client].iloc[0]
+        maid_row   = maids_latest[maids_latest["maid_id"].astype(str) == str(sel_maid)].iloc[0]
+
+        # Quick context side-by-side
+        cA, cB = st.columns(2)
+        with cA:
+            st.caption("Client needs snapshot")
+            st.write({
+                "household": client_row.get("clientmts_household_type"),
+                "pets": client_row.get("clientmts_pet_type"),
+                "living": client_row.get("clientmts_living_arrangement"),
+                "dayoff": client_row.get("clientmts_dayoff_policy"),
+                "cuisine": client_row.get("clientmts_cuisine_preference"),
+                "nat_pref": client_row.get("clientmts_nationality_preference"),
+                "special": client_row.get("clientmts_special_cases"),
+            })
+        with cB:
+            st.caption("Maid capabilities snapshot")
+            st.write({
+                "childcare flags": f"infant_block={int(maid_row.get('infant_block',0))}, infant_skill={int(maid_row.get('infant_skill',0))}, manykids_block={int(maid_row.get('manykids_block',0))}, manykids_skill={int(maid_row.get('manykids_skill',0))}",
+                "pets flags": f"cats_block={int(maid_row.get('cats_block',0))}, dogs_block={int(maid_row.get('dogs_block',0))}, cats_skill={int(maid_row.get('cats_skill',0))}, dogs_skill={int(maid_row.get('dogs_skill',0))}",
+                "living": f"requires_private_room={int(maid_row.get('requires_private_room',0))}, avoids_abudhabi={int(maid_row.get('avoids_abudhabi',0))}, mobility={int(maid_row.get('mobility_flex',0))}",
+                "dayoff": f"flexible={int(maid_row.get('dayoff_flexible',0))}, sunday_only={int(maid_row.get('dayoff_sunday_only',0))}",
+                "soft": f"non_smoker={int(maid_row.get('maid_non_smoker_flag',0))}, energetic={int(maid_row.get('energetic',0))}, no_attitude={int(maid_row.get('no_attitude',0))}, no_tiktok={int(maid_row.get('no_tiktok',0))}, veg={int(maid_row.get('veg_friendly',0))}",
+                "care": f"elderly_ok={int(maid_row.get('elderly_ok',0))}, special_ok={int(maid_row.get('special_ok',0))}",
+                "cooking": maid_row.get("cooking_details"),
+                "languages": maid_row.get("maid_speaks_language"),
+                "nationality": maid_row.get("maid_grouped_nationality") or _grouped_nat_from_raw(maid_row.get("maid_nationality")),
+            })
+
+        policy = st.radio("Policy for this pair", ["strict", "balanced", "flexible"], index=1, horizontal=True)
+
+        if st.button("🎯 Score this Pair"):
+            pair_row = _make_pair_row(client_row, maid_row)
+            score, decision, notes = score_pair(pair_row, policy=policy)
+
+            # Color helpers
+            def _badge(text, color):
+                st.markdown(
+                    f"""
+                    <div style="
+                        display:inline-block; padding:6px 10px; border-radius:14px;
+                        background:{color}; color:white; font-weight:600;">
+                        {text}
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
+            def _score_color(s):
+                if s >= 75: return "#2e7d32"   # green
+                if s >= 50: return "#f9a825"   # amber
+                return "#c62828"               # red
+
+            def _decision_color(d):
+                return {"OK":"#2e7d32","REVIEW":"#f9a825","BLOCK":"#c62828"}.get(d, "#607d8b")
+
+            # Visuals
+            st.subheader("Result")
+            col1, col2 = st.columns([2,1])
+            with col1:
+                # score bar (uses default blue progress) plus colored badge
+                st.progress(int(score) / 100.0)
+                _badge(f"Score: {int(score)} / 100", _score_color(score))
+            with col2:
+                _badge(f"Decision: {decision}", _decision_color(decision))
+
+            # Notes
+            with st.expander("Rationale (notes)"):
+                if notes:
+                    # Light formatting: split semicolon tokens
+                    bullets = [n.strip() for n in str(notes).split(";") if n.strip()]
+                    st.markdown("\n".join([f"- {b}" for b in bullets]))
+                else:
+                    st.write("No specific adjustments; base score only.")
+
+            # Save a tiny history
+            hist = st.session_state.setdefault("pair_score_history", [])
+            hist.append({
+                "client_name": sel_client,
+                "maid_id": sel_maid,
+                "policy": policy,
+                "score": int(score),
+                "decision": decision,
+                "notes": notes,
+            })
+            st.session_state["pair_score_history"] = hist
+
+        # Optional: show history table
+        if st.session_state.get("pair_score_history"):
+            st.markdown("#### Recent pair scores")
+            st.dataframe(pd.DataFrame(st.session_state["pair_score_history"]).tail(10), use_container_width=True)
+
