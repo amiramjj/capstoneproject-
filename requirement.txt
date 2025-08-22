@@ -1,15 +1,11 @@
 streamlit>=1.36
 pandas>=2.2
 numpy>=1.26
+openpyxl>=3.1
 
-# for later phases (predictions & NLP) — safe to include now
 scikit-learn>=1.4
 lightgbm>=4.3
-google-generativeai>=0.7.2
-python-dotenv>=1.0
 
-google-generativeai
 google-generativeai>=0.8.5
 protobuf>=4.25,<5
-google-generativeai>=0.7.2
-
+python-dotenv>=1.0
