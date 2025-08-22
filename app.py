@@ -1929,112 +1929,122 @@ def _norm_theme(s) -> str:
 def _load_theme_map(file, entity_key: str) -> dict[str, dict[str, int]]:
     """
     Robustly load your themes JSON and return:
-        { <entity_id>: { <theme>: frequency, ... }, ... }
-    (accepts several shapes; unchanged logic, now normalizes tokens)
+        { <entity_id>: { <theme_or_subcategory>: frequency, ... }, ... }
+
+    Accepts shapes:
+      A) {"items":[{"client_name"/"maid_id"/"id":..., "rows":[{themes:[], subcategories:[]}, ...]}, ...]}
+      B) { "<id>": [ {themes:[], subcategories:[]}, ... ], ... }
+      C) [ {client_name/maid_id: "...", themes:[], subcategories:[]}, ... ]
+      D) Same as above but using keys: all_case_themes / subcategory_themes / subcats
     """
     if not file:
         return {}
 
+    import json
     file.seek(0)
     raw = json.loads(file.read().decode("utf-8"))
 
-    mapping = None
-    if isinstance(raw, dict):
-        if "clients" in raw and isinstance(raw["clients"], (dict, list)):
-            mapping = raw["clients"]
-        elif "maids" in raw and isinstance(raw["maids"], (dict, list)):
-            mapping = raw["maids"]
-        elif "entities" in raw and isinstance(raw["entities"], list):
-            mapping = {}
-            for e in raw["entities"]:
-                if not isinstance(e, dict):
-                    continue
-                k = str(
-                    e.get("id")
-                    or e.get(entity_key)
-                    or e.get("client_name")
-                    or e.get("maid_id")
-                    or ""
-                )
-                if not k:
-                    continue
-                rows = e.get("rows") or e.get("items") or e.get("complaints") or []
-                if isinstance(rows, dict):
-                    rows = [rows]
-                if not isinstance(rows, list):
-                    rows = []
-                mapping[k] = rows
-        else:
-            ok = True
-            for v in raw.values():
-                if not isinstance(v, (list, dict, type(None))):
-                    ok = False
-                    break
-            if ok:
-                mapping = {}
-                for k, v in raw.items():
-                    if v is None:
-                        rows = []
-                    elif isinstance(v, dict):
-                        rows = [v]
-                    elif isinstance(v, list):
-                        rows = v
-                    else:
-                        rows = []
-                    mapping[str(k)] = rows
+    def _collect_from_row(r: dict) -> list[str]:
+        vals = []
+        # broad categories
+        for k in ("themes", "all_case_themes", "all_themes"):
+            v = r.get(k)
+            if isinstance(v, list):
+                # tolerate [{"theme": "..."}] shape
+                if v and all(isinstance(x, dict) and "theme" in x for x in v):
+                    vals.extend(str(x["theme"]) for x in v)
+                else:
+                    vals.extend(str(x) for x in v)
+        # specific subcategories
+        for k in ("subcategories", "subcategory_themes", "subcats", "top_subcategories"):
+            v = r.get(k)
+            if isinstance(v, list):
+                if v and all(isinstance(x, dict) and "subcategory" in x for x in v):
+                    vals.extend(str(x["subcategory"]) for x in v)
+                else:
+                    vals.extend(str(x) for x in v)
+        # normalize
+        return [s.strip().lower() for s in vals if str(s).strip()]
 
-    if mapping is None and isinstance(raw, list):
-        mapping = {}
+    theme_map: dict[str, dict[str, int]] = {}
+
+    # ---- Shape A: report wrapper with `items`
+    if isinstance(raw, dict) and isinstance(raw.get("items"), list):
+        for it in raw["items"]:
+            if not isinstance(it, dict):
+                continue
+            ent = str(
+                it.get(entity_key)
+                or it.get("id")
+                or it.get("client_name")
+                or it.get("maid_id")
+                or ""
+            )
+            if not ent:
+                continue
+            rows = it.get("rows") or []
+            if not isinstance(rows, list):
+                rows = []
+            bag: dict[str, int] = {}
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                for tok in _collect_from_row(r):
+                    bag[tok] = bag.get(tok, 0) + 1
+            theme_map[ent] = bag
+        return theme_map
+
+    # ---- Shape B: mapping {id: [rows], ...} or {id: {single_row}}
+    if isinstance(raw, dict):
+        ok = True
+        for v in raw.values():
+            if not isinstance(v, (list, dict, type(None))):
+                ok = False
+                break
+        if ok:
+            for k, v in raw.items():
+                rows = []
+                if v is None:
+                    rows = []
+                elif isinstance(v, dict):
+                    rows = [v]
+                elif isinstance(v, list):
+                    rows = v
+                bag: dict[str, int] = {}
+                for r in rows:
+                    if not isinstance(r, dict):
+                        continue
+                    for tok in _collect_from_row(r):
+                        bag[tok] = bag.get(tok, 0) + 1
+                theme_map[str(k)] = bag
+            return theme_map
+
+    # ---- Shape C: flat list of rows → group by entity_key
+    if isinstance(raw, list):
+        grouped: dict[str, list[dict]] = {}
         for r in raw:
             if not isinstance(r, dict):
                 continue
-            k = str(
+            ent = str(
                 r.get(entity_key)
                 or r.get("id")
                 or r.get("client_name")
                 or r.get("maid_id")
                 or ""
             )
-            if not k:
+            if not ent:
                 continue
-            mapping.setdefault(k, []).append(r)
+            grouped.setdefault(ent, []).append(r)
+        for ent, rows in grouped.items():
+            bag: dict[str, int] = {}
+            for r in rows:
+                for tok in _collect_from_row(r):
+                    bag[tok] = bag.get(tok, 0) + 1
+            theme_map[ent] = bag
+        return theme_map
 
-    if mapping is None:
-        return {}
-
-    theme_map: dict[str, dict[str, int]] = {}
-    for ent_id, rows in mapping.items():
-        if rows is None:
-            rows = []
-        if isinstance(rows, dict):
-            rows = [rows]
-        if not isinstance(rows, list):
-            rows = []
-
-        counter: dict[str, int] = {}
-        for r in rows:
-            if not isinstance(r, dict):
-                continue
-
-            all_themes = []
-            for key in ("all_case_themes", "themes", "all_themes"):
-                v = r.get(key)
-                if isinstance(v, list):
-                    all_themes.extend(v)
-            for key in ("subcategory_themes", "subcats", "subcategories"):
-                v = r.get(key)
-                if isinstance(v, list):
-                    all_themes.extend(v)
-
-            for t in all_themes:
-                t = _norm_theme(t)  # <-- normalize
-                if not t:
-                    continue
-                counter[t] = counter.get(t, 0) + 1
-
-        theme_map[str(ent_id).strip()] = counter  # strip IDs when storing
-
-    return theme_map
+    # Unknown shape → empty
+    return {}
 
 client_theme_map = _load_theme_map(client_json_file, "client_name")
 maid_theme_map   = _load_theme_map(maid_json_file, "maid_id")
