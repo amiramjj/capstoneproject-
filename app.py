@@ -361,13 +361,11 @@ else:
 # Streamlit: Engineering (MTS → Features)
 # Mirrors your exact notebook logic
 # ==============================
-# After cleaning is done and deduped_df is available
-if st.button(" Run Feature Engineering (ERP Lists)"):
-    engineered_df = run_engineering(deduped_df)
 
 import pandas as pd
 import streamlit as st
 
+# Define FIRST (so it exists when the script reruns)
 def run_engineering(deduped_df: pd.DataFrame) -> pd.DataFrame:
     st.markdown("---")
     st.header("Step 2 — Feature Engineering from ERP Lists (Exact Parity)")
@@ -376,42 +374,40 @@ def run_engineering(deduped_df: pd.DataFrame) -> pd.DataFrame:
 
     # ---------- Helpers ----------
     def _standardize_series_to_trait_lists(series: pd.Series, do_lebanon_fix=False):
-        # Fill, lower, replace '||' with ',', optional 'lebanon'→'lebanese', split, strip, keep non-empty
         s = (
-            series.fillna('')
+            series.fillna("")
             .astype(str)
             .str.lower()
-            .str.replace('||', ',', regex=False)
+            .str.replace("||", ",", regex=False)
         )
         if do_lebanon_fix:
-            s = s.str.replace('lebanon', 'lebanese', regex=False)
-        return s.str.split(',').apply(lambda x: [t.strip() for t in x if t.strip() != ''])
+            s = s.str.replace("lebanon", "lebanese", regex=False)
+        return s.str.split(",").apply(lambda x: [t.strip() for t in x if t.strip() != ""])
 
     def get_all_trait_counts_standardized(df_, col_name):
         traits_series = (
             df_[col_name]
             .dropna()
             .astype(str)
-            .str.replace('||', ',', regex=False)
+            .str.replace("||", ",", regex=False)
             .str.lower()
-            .str.split(',')
+            .str.split(",")
             .explode()
             .str.strip()
         )
         vc = traits_series.value_counts()
-        return pd.DataFrame({'Trait': vc.index, 'Count': vc.values})
+        return pd.DataFrame({"Trait": vc.index, "Count": vc.values})
 
     # ---------- Client MTS ----------
-    # v1: Standardize 'lebanon'→'lebanese' in client_mts_at_hiring (exactly as in your code)
-    df['client_mts_at_hiring'] = (
-        df['client_mts_at_hiring']
+    df["client_mts_at_hiring"] = (
+        df["client_mts_at_hiring"]
         .astype(str)
-        .str.replace('||', ',', regex=False)
+        .str.replace("||", ",", regex=False)
         .str.lower()
-        .str.replace('lebanon', 'lebanese', regex=False)
+        .str.replace("lebanon", "lebanese", regex=False)
     )
 
-    # Trait counts (display)
+    # Trait counts (display only)
     client_mts_table = get_all_trait_counts_standardized(df, "client_mts_at_hiring")
     maid_mts_table   = get_all_trait_counts_standardized(df, "maid_mts_at_hiring")
     maid_pref_table  = get_all_trait_counts_standardized(df, "maids_custom_preferences_at_hiring")
@@ -425,16 +421,16 @@ def run_engineering(deduped_df: pd.DataFrame) -> pd.DataFrame:
         st.dataframe(maid_pref_table, use_container_width=True)
 
     # Safe fill before tokenizing
-    df['client_mts_at_hiring'] = df['client_mts_at_hiring'].fillna('no_preference')
-    df['maid_mts_at_hiring'] = df['maid_mts_at_hiring'].fillna('no_preference')
-    df['maids_custom_preferences_at_hiring'] = df['maids_custom_preferences_at_hiring'].fillna('no_preference')
+    df["client_mts_at_hiring"] = df["client_mts_at_hiring"].fillna("no_preference")
+    df["maid_mts_at_hiring"] = df["maid_mts_at_hiring"].fillna("no_preference")
+    df["maids_custom_preferences_at_hiring"] = df["maids_custom_preferences_at_hiring"].fillna("no_preference")
 
-    # Tokenize to lists (client lebanon→lebanese fix ON; maid & prefs as-is)
-    client_mts_raw = _standardize_series_to_trait_lists(df['client_mts_at_hiring'], do_lebanon_fix=True)
-    maid_mts_raw   = _standardize_series_to_trait_lists(df['maid_mts_at_hiring'])
-    maid_pref_raw  = _standardize_series_to_trait_lists(df['maids_custom_preferences_at_hiring'])
+    # Tokenize (client fix ON; maid & prefs as-is)
+    client_mts_raw = _standardize_series_to_trait_lists(df["client_mts_at_hiring"], do_lebanon_fix=True)
+    maid_mts_raw   = _standardize_series_to_trait_lists(df["maid_mts_at_hiring"])
+    maid_pref_raw  = _standardize_series_to_trait_lists(df["maids_custom_preferences_at_hiring"])
 
-    # ---------- Client feature extractors (prefixed to avoid name shadowing) ----------
+    # ---------- Client feature extractors ----------
     def client_get_household_type(traits):
         baby = "has a baby younger than 2 years old" in traits
         kids = "has 3 kids or more" in traits
@@ -480,19 +476,15 @@ def run_engineering(deduped_df: pd.DataFrame) -> pd.DataFrame:
 
     def client_get_living_arrangement(traits):
         arrangement = []
-        if "live out" in traits:
-            arrangement.append("live_out")
-        if "has a private room" in traits:
-            arrangement.append("private_room")
-        if "lives in abu dhabi" in traits:
-            arrangement.append("abu_dhabi")
+        if "live out" in traits:            arrangement.append("live_out")
+        if "has a private room" in traits:  arrangement.append("private_room")
+        if "lives in abu dhabi" in traits:  arrangement.append("abu_dhabi")
         return "+".join(arrangement) if arrangement else "unspecified"
 
     def client_get_cuisine_preference(traits):
         selected = [c for c in ["lebanese", "khaleeji", "international"] if c in traits]
         return "+".join(selected) if selected else "other"
 
-    # Apply client extractors
     df["clientmts_household_type"]         = client_mts_raw.apply(client_get_household_type)
     df["clientmts_special_cases"]          = client_mts_raw.apply(client_get_special_case)
     df["clientmts_pet_type"]               = client_mts_raw.apply(client_get_pet_type)
@@ -501,22 +493,7 @@ def run_engineering(deduped_df: pd.DataFrame) -> pd.DataFrame:
     df["clientmts_living_arrangement"]     = client_mts_raw.apply(client_get_living_arrangement)
     df["clientmts_cuisine_preference"]     = client_mts_raw.apply(client_get_cuisine_preference)
 
-    # Client summaries
-    client_summary_tables = {
-        "clientmts_household_type":         df["clientmts_household_type"].value_counts().reset_index(names=["value","count"]),
-        "clientmts_special_cases":          df["clientmts_special_cases"].value_counts().reset_index(names=["value","count"]),
-        "clientmts_pet_type":               df["clientmts_pet_type"].value_counts().reset_index(names=["value","count"]),
-        "clientmts_dayoff_policy":          df["clientmts_dayoff_policy"].value_counts().reset_index(names=["value","count"]),
-        "clientmts_nationality_preference": df["clientmts_nationality_preference"].value_counts().reset_index(names=["value","count"]),
-        "clientmts_living_arrangement":     df["clientmts_living_arrangement"].value_counts().reset_index(names=["value","count"]),
-        "clientmts_cuisine_preference":     df["clientmts_cuisine_preference"].value_counts().reset_index(names=["value","count"]),
-    }
-    with st.expander("Client Feature Distributions", expanded=False):
-        for name, tbl in client_summary_tables.items():
-            st.caption(name)
-            st.dataframe(tbl, use_container_width=True)
-
-    # ---------- Maid MTS extractors ----------
+    # ---------- Maid MTS ----------
     def maid_get_household_type(traits):
         baby = "has a baby younger than 2 years old" in traits
         kids = "has 3 kids or more" in traits
@@ -547,25 +524,12 @@ def run_engineering(deduped_df: pd.DataFrame) -> pd.DataFrame:
             return "avoids_abu_dhabi"
         return "unspecified"
 
-    # Apply maid extractors
-    df["maidmts_household_type"]    = maid_mts_raw.apply(maid_get_household_type)
-    df["maidmts_pet_type"]          = maid_mts_raw.apply(maid_get_pet_type)
-    df["maidmts_dayoff_policy"]     = maid_mts_raw.apply(maid_get_dayoff_policy)
+    df["maidmts_household_type"]     = maid_mts_raw.apply(maid_get_household_type)
+    df["maidmts_pet_type"]           = maid_mts_raw.apply(maid_get_pet_type)
+    df["maidmts_dayoff_policy"]      = maid_mts_raw.apply(maid_get_dayoff_policy)
     df["maidmts_living_arrangement"] = maid_mts_raw.apply(maid_get_living_arrangement)
 
-    # Maid summaries
-    maid_summary_tables = {
-        "maidmts_household_type":    df["maidmts_household_type"].value_counts().reset_index(names=["value","count"]),
-        "maidmts_pet_type":          df["maidmts_pet_type"].value_counts().reset_index(names=["value","count"]),
-        "maidmts_dayoff_policy":     df["maidmts_dayoff_policy"].value_counts().reset_index(names=["value","count"]),
-        "maidmts_living_arrangement": df["maidmts_living_arrangement"].value_counts().reset_index(names=["value","count"]),
-    }
-    with st.expander("Maid Feature Distributions", expanded=False):
-        for name, tbl in maid_summary_tables.items():
-            st.caption(name)
-            st.dataframe(tbl, use_container_width=True)
-
-    # ---------- Maid Preferences extractors ----------
+    # ---------- Maid Preferences ----------
     def maidpref_get_education(traits):
         has_university = "has university degree" in traits
         has_school     = "has a school degree" in traits
@@ -575,10 +539,8 @@ def run_engineering(deduped_df: pd.DataFrame) -> pd.DataFrame:
         return "not_specified"
 
     def maidpref_get_kids_experience(traits):
-        less2 = (
-            "maid has experience with kids under 6 months old" in traits
-            or "maid has experience with kids between 6 months and 2 years" in traits
-        )
+        less2 = ("maid has experience with kids under 6 months old" in traits
+                 or "maid has experience with kids between 6 months and 2 years" in traits)
         above2 = "maid has experience with kids above 2 years old" in traits
         if less2 and above2: return "both"
         if less2:            return "lessthan2"
@@ -604,7 +566,7 @@ def run_engineering(deduped_df: pd.DataFrame) -> pd.DataFrame:
         return "+".join(matched) if matched else "not_mentioned"
 
     def maidpref_get_travel(traits):
-        travel = "maid does not mind travelling" in traits
+        travel   = "maid does not mind travelling" in traits
         relocate = "don’t mind relocating" in traits or "don't mind relocating" in traits
         if travel and relocate: return "travel_and_relocate"
         if travel:              return "travel"
@@ -623,7 +585,6 @@ def run_engineering(deduped_df: pd.DataFrame) -> pd.DataFrame:
         if special:                                   return "special_needs"
         return "none"
 
-    # Apply maid preference extractors
     df["maidpref_education"]          = maid_pref_raw.apply(maidpref_get_education)
     df["maidpref_kids_experience"]    = maid_pref_raw.apply(maidpref_get_kids_experience)
     df["maidpref_pet_handling"]       = maid_pref_raw.apply(maidpref_get_pet_handling)
@@ -631,21 +592,6 @@ def run_engineering(deduped_df: pd.DataFrame) -> pd.DataFrame:
     df["maidpref_travel"]             = maid_pref_raw.apply(maidpref_get_travel)
     df["maidpref_smoking"]            = maid_pref_raw.apply(maidpref_get_smoking)
     df["maidpref_caregiving_profile"] = maid_pref_raw.apply(maidpref_get_caregiving)
-
-    # Maid preference summaries
-    maid_pref_summary_tables = {
-        "maidpref_education":          df["maidpref_education"].value_counts().reset_index(names=["value","count"]),
-        "maidpref_kids_experience":    df["maidpref_kids_experience"].value_counts().reset_index(names=["value","count"]),
-        "maidpref_pet_handling":       df["maidpref_pet_handling"].value_counts().reset_index(names=["value","count"]),
-        "maidpref_personality":        df["maidpref_personality"].value_counts().reset_index(names=["value","count"]),
-        "maidpref_travel":             df["maidpref_travel"].value_counts().reset_index(names=["value","count"]),
-        "maidpref_smoking":            df["maidpref_smoking"].value_counts().reset_index(names=["value","count"]),
-        "maidpref_caregiving_profile": df["maidpref_caregiving_profile"].value_counts().reset_index(names=["value","count"]),
-    }
-    with st.expander("Maid Preferences Distributions", expanded=False):
-        for name, tbl in maid_pref_summary_tables.items():
-            st.caption(name)
-            st.dataframe(tbl, use_container_width=True)
 
     # ---------- Preview + Download ----------
     st.subheader("Engineered Columns (preview)")
@@ -674,3 +620,21 @@ def run_engineering(deduped_df: pd.DataFrame) -> pd.DataFrame:
     )
 
     return df
+
+# --------- UI to trigger engineering (after the function is defined) ---------
+# Show a preview if we have deduped data in session
+if st.session_state.deduped_df is not None:
+    st.markdown("### Deduped preview (from session)")
+    st.dataframe(st.session_state.deduped_df.head(10), use_container_width=True)
+else:
+    st.info("Run Cleaning & Preprocessing first to enable feature engineering.")
+
+# Button is disabled if there is no deduped data yet
+if st.button("🧩 Run Feature Engineering (ERP Lists)", disabled=st.session_state.deduped_df is None):
+    engineered_df = run_engineering(st.session_state.deduped_df)
+    st.session_state.engineered_df = engineered_df
+
+# Optional: show engineered preview if available
+if st.session_state.engineered_df is not None:
+    st.markdown("### Engineered preview (from session)")
+    st.dataframe(st.session_state.engineered_df.head(10), use_container_width=True)
