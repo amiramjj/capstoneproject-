@@ -1348,7 +1348,15 @@ import json
 import time
 import pandas as pd
 import streamlit as st
-import google.generativeai as genai
+try:
+    import google.generativeai as genai
+except ModuleNotFoundError:
+    import streamlit as st
+    st.error(
+        "Missing dependency: `google-generativeai`. "
+        "Add it to requirements.txt (or `pip install google-generativeai`) and redeploy."
+    )
+    st.stop()
 
 st.set_page_config(page_title="Complaint Themes Extractor", layout="centered")
 
