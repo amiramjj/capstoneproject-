@@ -2123,40 +2123,71 @@ client_cols = [c for c in df_work.columns if c.startswith("clientmts_")]
 maid_cols_mts   = [c for c in df_work.columns if c.startswith("maidmts_")]
 maid_cols_pref  = [c for c in df_work.columns if c.startswith("maidpref_")]
 
+# --- helper: derive maid types from flags/codes when maidmts_/maidpref_ are absent
+def _maid_pretty_from_row(r: pd.Series) -> dict:
+    out = {}
+
+    # mobility_flex: 0/1/2 → label
+    if "mobility_flex" in r and pd.notna(r["mobility_flex"]):
+        mf = int(r["mobility_flex"])
+        out["mobility"] = {0: "-", 1: "travel_or_relocate", 2: "travel_and_relocate"}.get(mf, "-")
+
+    # education from code if present, else fall back to maidpref_education if you kept it
+    if "maid_education_level" in r and pd.notna(r["maid_education_level"]):
+        ed = int(r["maid_education_level"])
+        out["education"] = {2: "university", 1: "school", 0: "not_specified"}.get(ed, "not_specified")
+    elif "maidpref_education" in r and pd.notna(r["maidpref_education"]):
+        out["education"] = str(r["maidpref_education"])
+
+    if "maid_non_smoker_flag" in r and pd.notna(r["maid_non_smoker_flag"]) and int(r["maid_non_smoker_flag"]) == 1:
+        out["non_smoker"] = "yes"
+
+    # soft traits: show count + which ones we can detect
+    trait_names = []
+    for col, label in [("energetic", "energetic"),
+                       ("no_attitude", "no_attitude"),
+                       ("no_tiktok", "no_tiktok"),
+                       ("veg_friendly", "veg_friendly")]:
+        if col in r and pd.notna(r[col]) and int(r[col]) == 1:
+            trait_names.append(label)
+    if "maid_personality_score" in r and pd.notna(r["maid_personality_score"]):
+        score = int(r["maid_personality_score"])
+        out["soft_traits"] = f"{score}({','.join(trait_names)})" if trait_names else str(score)
+
+    return out
+
+
 def _types_row(client_id: str, maid_id: str) -> dict:
-    """Return engineered matching types for the client & maid.
-    1) Try the exact (client, maid) row.
-    2) If absent, fall back to the latest row for that client (any maid).
-    3) Likewise for the maid (any client).
-    """
-    def _latest(mask, cols):
-        if not mask.any():
-            return {}
-        sub = df_work.loc[mask, cols + (["tag_date"] if "tag_date" in df_work.columns else [])]
+    """Return engineered matching types for both sides with robust fallbacks."""
+    def _latest_row(mask):
+        sub = df_work.loc[mask]
         if sub.empty:
-            return {}
+            return None
         if "tag_date" in sub.columns:
-            sub = sub.sort_values("tag_date").iloc[-1]
-        else:
-            sub = sub.iloc[0]
-        return {c: sub[c] for c in cols if pd.notna(sub.get(c))}
+            return sub.sort_values("tag_date").iloc[-1]
+        return sub.iloc[0]
 
-    # 1) Try exact pair
-    pair_mask = (df_work["client_name"].astype(str) == str(client_id)) & \
-                (df_work["maid_id"].astype(str)     == str(maid_id))
+    # Prefer the exact pair row, else latest for each side
+    pair_row   = _latest_row((df_work["client_name"].astype(str) == str(client_id)) &
+                              (df_work["maid_id"].astype(str)   == str(maid_id)))
+    client_row = pair_row if pair_row is not None else _latest_row(df_work["client_name"].astype(str).eq(str(client_id)))
+    maid_row   = pair_row if pair_row is not None else _latest_row(df_work["maid_id"].astype(str).eq(str(maid_id)))
 
-    if pair_mask.any():
-        row = df_work.loc[pair_mask].sort_values("tag_date").iloc[-1] if "tag_date" in df_work.columns \
-              else df_work.loc[pair_mask].iloc[0]
-        client_types = {c: row[c] for c in client_cols if pd.notna(row.get(c))}
-        maid_types   = {c: row[c] for c in (maid_cols_mts + maid_cols_pref) if pd.notna(row.get(c))}
-        return {"client": client_types, "maid": maid_types}
+    # Client: original engineered categories always live in clientmts_*
+    client_types = {}
+    if client_row is not None:
+        client_types = {c: client_row[c]
+                        for c in client_cols
+                        if c in client_row and pd.notna(client_row.get(c))}
 
-    # 2) Fall back: latest for this client (any maid)
-    client_types = _latest(df_work["client_name"].astype(str).eq(str(client_id)), client_cols)
-
-    # 3) Fall back: latest for this maid (any client)
-    maid_types   = _latest(df_work["maid_id"].astype(str).eq(str(maid_id)), maid_cols_mts + maid_cols_pref)
+    # Maid: try maidmts_/maidpref_ first; if absent/empty, build from flags/codes
+    maid_types = {}
+    if maid_row is not None:
+        maid_types = {c: maid_row[c]
+                      for c in (maid_cols_mts + maid_cols_pref)
+                      if c in maid_row and pd.notna(maid_row.get(c))}
+        if not maid_types:  # derive from flags/codes
+            maid_types = _maid_pretty_from_row(maid_row)
 
     return {"client": client_types, "maid": maid_types}
 # ---------- 5) Build the score matrix ----------
