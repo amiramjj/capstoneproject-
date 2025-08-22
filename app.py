@@ -612,3 +612,223 @@ if st.button("🧩 Run Feature Engineering (ERP Lists)", disabled=deduped_df_ss 
 if st.session_state.get("engineered_df") is not None:
     st.markdown("### Engineered preview (from session)")
     st.dataframe(st.session_state["engineered_df"].head(10), use_container_width=True)
+
+
+
+
+
+# ==============================
+# Step 2B — Flags, Codes, Language One-Hots (add-on)
+# ==============================
+def run_engineering_step2b(df_in: pd.DataFrame) -> pd.DataFrame:
+    st.markdown("---")
+    st.header("Step 2B — Maid Capability Flags, Ordinal Codes, Language One-Hots")
+
+    df = df_in.copy()
+
+    # ---- ensure required columns exist (fill with NA if missing) ----
+    needed = [
+        "maidmts_household_type","maidpref_kids_experience",
+        "maidmts_pet_type","maidpref_pet_handling",
+        "maidmts_living_arrangement","maidpref_travel",
+        "maidmts_dayoff_policy","maidpref_smoking",
+        "maidpref_education","maidpref_caregiving_profile","maidpref_personality",
+        "maid_speaks_language"
+    ]
+    for c in needed:
+        if c not in df.columns:
+            df[c] = pd.NA
+
+    # --- helpers (names prefixed to avoid collisions) ---
+    def _fx_split_tokens(s):
+        if pd.isna(s): return []
+        return [t.strip() for t in str(s).lower().split("+") if t.strip()]
+
+    def _fx_has_token(series, token):
+        return series.apply(lambda v: token in _fx_split_tokens(v)).astype(int)
+
+    def _fx_in_set(series, values):
+        vals = set(v.lower() for v in values)
+        return series.apply(lambda v: (str(v).lower() in vals) if pd.notna(v) else False).astype(int)
+
+    def _fx_mobility_code(s):
+        s = (str(s).lower() if pd.notna(s) else "")
+        if s == "travel_and_relocate": return 2
+        if s in ("travel","relocate"): return 1
+        return 0
+
+    def _fx_dayoff_code(s):
+        s = (str(s).lower() if pd.notna(s) else "")
+        if "sunday_only" in s: return -2
+        if "flexible"    in s: return  1
+        return 0
+
+    def _fx_edu_level(s):
+        s = (str(s).lower() if pd.notna(s) else "")
+        if s in ("university","both"): return 2
+        if s == "school":              return 1
+        return 0
+
+    def _fx_care_flags(s):
+        s = (str(s).lower() if pd.notna(s) else "")
+        elderly_ok = int(s in ("elderly_experienced","elderly_and_special"))
+        special_ok = int(s in ("special_needs","elderly_and_special"))
+        return elderly_ok, special_ok
+
+    def _fx_personality_flags(s):
+        toks = set(_fx_split_tokens(s))
+        energetic    = int("energetic"    in toks)
+        no_attitude  = int("no_attitude"  in toks)
+        no_tiktok    = int("no_tiktok"    in toks)
+        veg_friendly = int("veg_friendly" in toks)
+        score = energetic + no_attitude + no_tiktok + veg_friendly
+        return energetic, no_attitude, no_tiktok, veg_friendly, score
+
+    # --- 1) FLAGS ---
+    # Kids / household
+    df["infant_block"]    = _fx_has_token(df["maidmts_household_type"], "baby")
+    df["manykids_block"]  = _fx_has_token(df["maidmts_household_type"], "many_kids")
+    df["infant_skill"]    = _fx_in_set(df["maidpref_kids_experience"], ["lessthan2","both"])
+    df["manykids_skill"]  = _fx_in_set(df["maidpref_kids_experience"], ["above2","both"])
+
+    # Pets
+    df["cats_block"]      = _fx_in_set(df["maidmts_pet_type"], ["cat","both"])
+    df["dogs_block"]      = _fx_in_set(df["maidmts_pet_type"], ["dog","both"])
+    df["cats_skill"]      = _fx_in_set(df["maidpref_pet_handling"], ["cats","both"])
+    df["dogs_skill"]      = _fx_in_set(df["maidpref_pet_handling"], ["dogs","both"])
+
+    # Living / mobility
+    df["requires_private_room"] = _fx_has_token(df["maidmts_living_arrangement"], "private_room")
+    df["avoids_abudhabi"]       = _fx_has_token(df["maidmts_living_arrangement"], "avoids_abu_dhabi")
+    df["mobility_flex"]         = df["maidpref_travel"].apply(_fx_mobility_code).astype(int)
+
+    # Day off
+    df["dayoff_sunday_only"] = df["maidmts_dayoff_policy"].apply(
+        lambda s: 1 if pd.notna(s) and "sunday_only" in str(s).lower() else 0
+    ).astype(int)
+    df["dayoff_flexible"] = df["maidmts_dayoff_policy"].apply(
+        lambda s: 1 if pd.notna(s) and "flexible" in str(s).lower() else 0
+    ).astype(int)
+
+    # Smoking / education
+    df["maid_non_smoker_flag"]  = df["maidpref_smoking"].apply(lambda s: 1 if str(s).lower()=="non_smoker" else 0).astype(int)
+    df["edu_university"]        = df["maidpref_education"].apply(lambda s: 1 if str(s).lower() in ("university","both") else 0).astype(int)
+    df["edu_school"]            = df["maidpref_education"].apply(lambda s: 1 if str(s).lower()=="school" else 0).astype(int)
+
+    # Caregiving specialization
+    care_pairs = df["maidpref_caregiving_profile"].apply(_fx_care_flags)
+    df["elderly_ok"] = care_pairs.apply(lambda x: x[0]).astype(int)
+    df["special_ok"] = care_pairs.apply(lambda x: x[1]).astype(int)
+
+    # Personality
+    pers = df["maidpref_personality"].apply(_fx_personality_flags)
+    df["energetic"]            = pers.apply(lambda x: x[0]).astype(int)
+    df["no_attitude"]          = pers.apply(lambda x: x[1]).astype(int)
+    df["no_tiktok"]            = pers.apply(lambda x: x[2]).astype(int)
+    df["veg_friendly"]         = pers.apply(lambda x: x[3]).astype(int)
+    df["maid_personality_score"] = pers.apply(lambda x: x[4]).astype(int)
+
+    # --- 2) COMPACT CODES ---
+    df["maid_kids_profile_code"] = np.select(
+        [
+            df["infant_block"].eq(1),
+            df["manykids_block"].eq(1),
+            (df["infant_skill"].eq(1) & df["manykids_skill"].eq(1)),
+            (df["infant_skill"].eq(1) | df["manykids_skill"].eq(1)),
+        ],
+        [-2, -1, 2, 1],
+        default=0
+    ).astype(int)
+
+    df["maid_pets_profile_code"] = np.select(
+        [
+            df["cats_block"].eq(1),
+            df["dogs_block"].eq(1),
+            (df["cats_skill"].eq(1) & df["dogs_skill"].eq(1)),
+            (df["cats_skill"].eq(1) | df["dogs_skill"].eq(1)),
+        ],
+        [-2, -1, 2, 1],
+        default=0
+    ).astype(int)
+
+    base_living = np.select(
+        [df["avoids_abudhabi"].eq(1), df["requires_private_room"].eq(1)],
+        [-2, -1],
+        default=0
+    )
+    df["maid_living_profile_code"] = (base_living + df["mobility_flex"]).astype(int)
+    df["maid_dayoff_flex_code"]    = df["maidmts_dayoff_policy"].apply(_fx_dayoff_code).astype(int)
+    df["maid_education_level"]     = df["maidpref_education"].apply(_fx_edu_level).astype(int)
+
+    df["maid_care_profile_code"] = np.select(
+        [
+            (df["elderly_ok"].eq(1) & df["special_ok"].eq(1)),
+        (df["elderly_ok"].eq(1) ^ df["special_ok"].eq(1)),
+        ],
+        [2, 1],
+        default=0
+    ).astype(int)
+
+    # --- 3) Language one-hots from maid_speaks_language ---
+    lang_col = "maid_speaks_language"
+    token_series = df[lang_col].fillna("not_specified").str.strip().str.split()
+    all_tokens = sorted({t for toks in token_series.dropna() for t in toks})
+    langs = [t for t in all_tokens if t.lower() != "not_specified"]
+
+    lang_cols = []
+    for L in langs:
+        colname = f"lang_{L}"
+        df[colname] = token_series.apply(lambda toks, L=L: int(isinstance(toks, list) and L in toks)).astype(int)
+        lang_cols.append(colname)
+
+    # --- UI: previews ---
+    with st.expander("Flags & Codes (preview)"):
+        preview_cols = [
+            "infant_block","manykids_block","infant_skill","manykids_skill",
+            "cats_block","dogs_block","cats_skill","dogs_skill",
+            "requires_private_room","avoids_abudhabi","mobility_flex",
+            "dayoff_sunday_only","dayoff_flexible","maid_non_smoker_flag",
+            "edu_university","edu_school","elderly_ok","special_ok",
+            "energetic","no_attitude","no_tiktok","veg_friendly","maid_personality_score",
+            "maid_kids_profile_code","maid_pets_profile_code","maid_living_profile_code",
+            "maid_dayoff_flex_code","maid_education_level","maid_care_profile_code",
+        ]
+        st.dataframe(df[[c for c in preview_cols if c in df.columns]].head(10), use_container_width=True)
+
+    if lang_cols:
+        with st.expander("Language one-hots"):
+            st.dataframe(df[lang_cols].head(10), use_container_width=True)
+
+    # Optional: drop the raw maid text columns we parsed from
+    drop_cols_raw = [
+        "maidmts_household_type","maidpref_kids_experience","maidmts_pet_type","maidpref_pet_handling",
+        "maidmts_living_arrangement","maidpref_travel","maidmts_dayoff_policy","maidpref_smoking",
+        "maidpref_education","maidpref_caregiving_profile","maidpref_personality",
+    ]
+    # If you prefer to keep them, comment the next line:
+    df = df.drop(columns=[c for c in drop_cols_raw if c in df.columns], errors="ignore")
+
+    # --- download ---
+    @st.cache_data
+    def _to_csv_bytes2(_df):
+        return _df.to_csv(index=False).encode("utf-8")
+
+    st.download_button(
+        "⬇️ Download Engineered + Step 2B",
+        data=_to_csv_bytes2(df),
+        file_name="engineered_features_step2b.csv",
+        mime="text/csv",
+    )
+
+    return df
+# ---- Step 2B trigger (after your existing engineering section) ----
+engineered_df_ss = st.session_state.get("engineered_df")
+
+if engineered_df_ss is not None:
+    if st.button("✅ Run Feature Engineering — Step 2B (Flags, Codes & Lang One-Hots)"):
+        df_step2b = run_engineering_step2b(engineered_df_ss)
+        st.session_state["engineered_df"] = df_step2b  # keep evolving the same key
+        st.success("Step 2B applied and saved to session.")
+else:
+    st.info("Run the first Feature Engineering step before Step 2B.")
+
