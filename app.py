@@ -1449,15 +1449,21 @@ def _prep_subset(df: pd.DataFrame):
     mask = s["complaint_summary"].str.lower().ne("no complaint") & s["complaint_summary"].ne("")
     return s.loc[mask].head(int(max_rows_each))
 
-def _summarize_theme_counts(rows):
+from collections import Counter
+
+def _summarize_theme_counts(themed_rows):
     theme_counter = Counter()
     sub_counter   = Counter()
-    for r in rows:
-        theme_counter.update(r["themes"])
-        sub_counter.update(r["subcats"])
-    top_themes = pd.DataFrame(theme_counter.most_common(20), columns=["theme","count"])
-    top_subs   = pd.DataFrame(sub_counter.most_common(20), columns=["subcategory","count"])
+    for r in themed_rows:
+        theme_counter.update(r.get("themes") or [])
+        # accept either 'subcats' or legacy 'subcategories'
+        subs = (r.get("subcats") or r.get("subcategories") or [])
+        sub_counter.update(subs)
+
+    top_themes = pd.DataFrame(theme_counter.most_common(20), columns=["theme", "count"])
+    top_subs   = pd.DataFrame(sub_counter.most_common(20),   columns=["subcategory", "count"])
     return top_themes, top_subs
+
 
 def _render_rows(df_subset, section_title, system_prompt: str):
     st.subheader(section_title)
@@ -1473,14 +1479,14 @@ def _render_rows(df_subset, section_title, system_prompt: str):
     themed_rows = []
     for k, (_, row) in enumerate(df_subset.iterrows(), start=1):
         res = extract_themes_cached(system_prompt.strip(), str(row["complaint_summary"]))
-        themed_rows.append({
+            themed_rows.append({
             "client_name": row.get("client_name"),
             "maid_id":     row.get("maid_id"),
             "tag_date":    row.get("tag_date"),
             "complaint_summary":  row["complaint_summary"],
             "complaint_comments": row["complaint_comments"],
-            "themes":      res["themes"],
-            "subcategories": res["subcats"],
+            "themes":  res.get("themes", []),
+            "subcats": res.get("subcats", []),   # <- use 'subcats'
         })
         prog.progress(k/len(df_subset))
 
@@ -1499,8 +1505,8 @@ def _render_rows(df_subset, section_title, system_prompt: str):
     # Pretty rows
     st.caption("Labeled complaints")
     def _row_html(r):
-        theme_html = " ".join(_chip(t, "theme") for t in r["themes"])
-        sub_html   = " ".join(_chip(t, "sub")   for t in r["subcategories"])
+        theme_html = " ".join(_chip(t, "theme") for t in (r.get("themes")  or []))
+        sub_html   = " ".join(_chip(t, "sub")   for t in (r.get("subcats") or []))
         comments   = r["complaint_comments"] or "—"
         return f"""
         <div style="border:1px solid #263238;border-radius:10px;padding:10px;margin-bottom:10px;">
@@ -1516,15 +1522,25 @@ def _render_rows(df_subset, section_title, system_prompt: str):
     html = "\n".join(_row_html(r) for _, r in out_df.iterrows())
     st.markdown(html, unsafe_allow_html=True)
 
-    # Export
-    csv_bytes = out_df.assign(
-        themes=lambda d: d["themes"].apply(lambda x: "; ".join(x)),
-        subcategories=lambda d: d["subcategories"].apply(lambda x: "; ".join(x)),
-    ).to_csv(index=False).encode("utf-8")
+      # --- Export (REPLACE your old export block with this) ---
+    def _join_list(x):
+        if isinstance(x, list):
+            return "; ".join(map(str, x))
+        return "" if (x is None or (isinstance(x, float) and pd.isna(x))) else str(x)
+
+    export_df = out_df.copy()
+    export_df["themes"]  = export_df["themes"].apply(_join_list)
+    export_df["subcats"] = export_df["subcats"].apply(_join_list)
+
+    csv_bytes = export_df.to_csv(index=False).encode("utf-8")
+
     st.download_button(
         f"⬇️ Download {section_title} themes",
-        data=csv_bytes, file_name=f"themes_{section_title.replace(' ','_').lower()}.csv", mime="text/csv"
+        data=csv_bytes,
+        file_name=f"themes_{section_title.replace(' ', '_').lower()}.csv",
+        mime="text/csv",
     )
+
     return out_df
     
 # --------- build the three views ---------
