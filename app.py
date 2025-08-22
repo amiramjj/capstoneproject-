@@ -1350,6 +1350,17 @@ from collections import Counter
 
 st.markdown("---")
 st.header("Client ↔︎ Maid Themes Explorer")
+# Inline prompt just for this explorer
+with st.expander("System instruction used below (Gemini)", expanded=True):
+    explorer_prompt = st.text_area(
+        "Paste the System instruction here",
+        value=st.session_state.get("system_prompt", ""),
+        height=180,
+        key="explorer_system_prompt",
+    )
+    save_prompt = st.checkbox("Save this prompt to session for reuse on other pages", value=True)
+    if save_prompt:
+        st.session_state["system_prompt"] = explorer_prompt.strip()
 
 # --------- pick a source DataFrame from session ---------
 df_scored      = st.session_state.get("scored_df")
@@ -1426,21 +1437,20 @@ def _summarize_theme_counts(rows):
     top_subs   = pd.DataFrame(sub_counter.most_common(20), columns=["subcategory","count"])
     return top_themes, top_subs
 
-def _render_rows(df_subset, section_title):
+def _render_rows(df_subset, section_title, system_prompt: str):
     st.subheader(section_title)
     if df_subset.empty:
         st.info("No complaint text to analyze in this section.")
         return pd.DataFrame()
 
-    system_prompt = st.session_state.get("system_prompt", "").strip()
-    if not system_prompt:
-        st.warning("Paste your System instruction in the Gemini test box (top of page).")
+    if not (system_prompt or "").strip():
+        st.warning("Please paste the System instruction in the box above.")
         return pd.DataFrame()
 
     prog = st.progress(0.0)
     themed_rows = []
     for k, (_, row) in enumerate(df_subset.iterrows(), start=1):
-        res = extract_themes_cached(system_prompt, row["complaint_summary"])
+        res = extract_themes_cached(system_prompt.strip(), str(row["complaint_summary"]))
         themed_rows.append({
             "client_name": row.get("client_name"),
             "maid_id":     row.get("maid_id"),
@@ -1494,7 +1504,7 @@ def _render_rows(df_subset, section_title):
         data=csv_bytes, file_name=f"themes_{section_title.replace(' ','_').lower()}.csv", mime="text/csv"
     )
     return out_df
-
+    
 # --------- build the three views ---------
 client_subset = _prep_subset(df_source[df_source["client_name"].astype(str) == str(sel_client)])
 maid_subset   = _prep_subset(df_source[df_source["maid_id"].astype(str) == str(sel_maid)])
@@ -1511,19 +1521,18 @@ st.write(
 # Action button
 if st.button("🧩 Extract themes for client, maid, and client→maid"):
     # A) Client history
-    df_client_out = _render_rows(client_subset, "Client history")
+    df_client_out = _render_rows(client_subset, "Client history", explorer_prompt)
     # B) Maid history
-    df_maid_out   = _render_rows(maid_subset, "Maid history")
-    # C) Pair intersection (with explicit comments highlight)
+    df_maid_out   = _render_rows(maid_subset, "Maid history", explorer_prompt)
+    # C) Pair intersection
     st.subheader("Client → Maid (intersection)")
     if pair_subset.empty:
         st.info("This client has no complaint entries on the selected maid.")
     else:
-        # Show raw comments consolidated first
         st.caption("Client comments about this maid")
         for _, r in pair_subset.iterrows():
             cm = r.get("complaint_comments") or ""
             if cm and cm.lower() != "no complaint":
                 st.markdown(f"- {cm}")
-        _render_rows(pair_subset, "Client→Maid")
+        _render_rows(pair_subset, "Client→Maid", explorer_prompt)
 
