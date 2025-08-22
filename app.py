@@ -8,7 +8,7 @@ from statistics import mode, StatisticsError
 
 import numpy as np
 import pandas as pd
-import streamlit as st 
+import streamlit as st
 
 # ---- Keep data across button clicks ----
 for k in ("cleaned_df", "deduped_df", "engineered_df"):
@@ -1342,31 +1342,25 @@ else:
 
 
 
-# app_themes.py — Complaint Themes Extractor (skeleton with batch)
+# ==============================================
+# Complaint Themes Extractor (Gemini) — inline block
+# (expects st.secrets: GOOGLE_API_KEY, optional ALT_GOOGLE_API_KEY, MODEL_NAME)
+# ==============================================
 import io
 import json
 import time
 import pandas as pd
 import streamlit as st
-try:
-    import google.generativeai as genai
-except ModuleNotFoundError:
-    import streamlit as st
-    st.error(
-        "Missing dependency: `google-generativeai`. "
-        "Add it to requirements.txt (or `pip install google-generativeai`) and redeploy."
-    )
-    st.stop()
-
-st.set_page_config(page_title="Complaint Themes Extractor", layout="centered")
+import google.generativeai as genai
 
 st.title("Complaint Themes Extractor")
 st.caption("Step 1: Skeleton app — we’ll add upload & extraction next.")
+
 st.success("If you can see this message after deployment, the app is wired up.")
 st.write("Key loaded:", "GOOGLE_API_KEY" in st.secrets)
-st.write("Model:", st.secrets.get("MODEL_NAME", "gemini-2.5-flash-lite"))
+st.write("Model:", st.secrets.get("MODEL_NAME"))
 
-# ---------------- Gemini test (single row) ----------------
+# ---------- Gemini test (single row) with summarize-on-error fallback ----------
 st.header("Gemini test (single row)")
 
 # 1) Check secret
@@ -1374,7 +1368,7 @@ if "GOOGLE_API_KEY" not in st.secrets:
     st.error("No GOOGLE_API_KEY in Secrets. Add it in the app’s Settings → Secrets.")
     st.stop()
 
-# 2) Configure SDK (primary vs alt key)
+# 2) Configure SDK ---- API key selector (primary vs alt) ----
 key_choice = st.radio("API key to use", ["primary", "alt"], horizontal=True, key="api_key_choice")
 ACTIVE_API_KEY = (
     st.secrets["GOOGLE_API_KEY"]
@@ -1397,7 +1391,6 @@ sample_text = st.text_area(
 )
 go = st.button("Test Gemini")
 
-# ---- Helpers ----
 def _parse_resp(resp):
     raw_text = getattr(resp, "text", None)
     if not raw_text and getattr(resp, "candidates", None):
@@ -1439,7 +1432,7 @@ def call_gemini_extract(system_instruction: str, complaint_text: str):
     raw = _parse_resp(resp)
     data = json.loads(raw or "{}")
 
-    # normalize spans
+    # normalize
     spans = data.get("evidence_spans", []) or []
     norm_spans = []
     for s in spans:
@@ -1447,7 +1440,6 @@ def call_gemini_extract(system_instruction: str, complaint_text: str):
             norm_spans.append({"quote": str(s["quote"])})
         elif isinstance(s, str):
             norm_spans.append({"quote": s})
-
     out = {
         "all_case_themes": data.get("all_case_themes", []) or [],
         "subcategory_themes": data.get("subcategory_themes", []) or [],
@@ -1456,7 +1448,7 @@ def call_gemini_extract(system_instruction: str, complaint_text: str):
     return out, raw
 
 def call_gemini_summarize(complaint_text: str) -> str:
-    """Fallback: compress to core issues only, then re-run extraction on the summary."""
+    """Fallback: compress to core issues only, then we re-run extraction on the summary."""
     model = genai.GenerativeModel(model_name=MODEL_NAME)
     generation_config = {
         "response_mime_type": "application/json",
@@ -1468,6 +1460,7 @@ def call_gemini_summarize(complaint_text: str) -> str:
         "max_output_tokens": 200,
         "temperature": 0.2,
     }
+    # Minimal, deterministic summary prompt
     summary_instruction = (
         "Summarize this complaint_summary into 3–5 short bullets (one paragraph OK) "
         "capturing ONLY substantive reasons/behaviors that could cause dissatisfaction or replacement. "
@@ -1475,7 +1468,11 @@ def call_gemini_summarize(complaint_text: str) -> str:
         "Be concise and neutral."
     )
     resp = model.generate_content(
-        [{"role": "user", "parts": [summary_instruction + f'\n\ncomplaint_summary: """{complaint_text}"""']}],
+        [
+            {"role": "user", "parts": [
+                summary_instruction + f'\n\ncomplaint_summary: """{complaint_text}"""'
+            ]}
+        ],
         generation_config=generation_config,
     )
     raw = _parse_resp(resp)
@@ -1483,10 +1480,12 @@ def call_gemini_summarize(complaint_text: str) -> str:
     return data.get("summary", "").strip()
 
 if go:
+    # remember inputs between reruns
     st.session_state["system_prompt"] = system_prompt
-    st.session_state["sample_text"] = sample_text
+    st.session_state["sample_text"]  = sample_text
+
     try:
-        out, _ = call_gemini_extract(system_prompt.strip(), sample_text.strip())
+        out, raw = call_gemini_extract(system_prompt.strip(), sample_text.strip())
         st.success("Got JSON:")
         st.json(out)
     except Exception as e1:
@@ -1495,7 +1494,7 @@ if go:
             summary = call_gemini_summarize(sample_text.strip())
             if not summary:
                 raise RuntimeError("Summarizer returned empty text")
-            out2, _ = call_gemini_extract(system_prompt.strip(), summary)
+            out2, raw2 = call_gemini_extract(system_prompt.strip(), summary)
             st.success("Fallback succeeded on summarized text.")
             with st.expander("Summary used for fallback"):
                 st.write(summary)
@@ -1503,10 +1502,11 @@ if go:
         except Exception as e2:
             st.error(f"Fallback also failed: {e2}")
 
-# ---------------- Batch setup: upload & select column ----------------
+# ---------- Batch setup: upload & select column (robust) ----------
 st.header("Batch extraction — upload & select column")
 
-uploaded = st.file_uploader("Upload CSV (or Excel) with a complaint text column", type=["csv", "xlsx"])
+uploaded = st.file_uploader("Upload CSV (or Excel) with a complaint text column",
+                            type=["csv", "xlsx"])
 
 def load_table(file):
     # Empty file guard
@@ -1520,42 +1520,42 @@ def load_table(file):
     file.seek(0)
     if file.name.lower().endswith(".xlsx"):
         return pd.read_excel(file)
-
     # CSV: auto-detect delimiter, tolerate weird encodings
     try:
         file.seek(0)
-        return pd.read_csv(file, sep=None, engine="python", encoding="utf-8", on_bad_lines="skip")
+        return pd.read_csv(file, sep=None, engine="python",
+                           encoding="utf-8", on_bad_lines="skip")
     except pd.errors.EmptyDataError:
         st.error("The file looks empty or not a valid CSV. Make sure it has a header row and at least one data row.")
         st.stop()
     except UnicodeDecodeError:
         file.seek(0)
-        return pd.read_csv(file, sep=None, engine="python", encoding_errors="ignore", on_bad_lines="skip")
+        return pd.read_csv(file, sep=None, engine="python",
+                           encoding_errors="ignore", on_bad_lines="skip")
 
 if uploaded is not None:
     df = load_table(uploaded)
-    st.session_state["df"] = df
+    st.session_state["df"] = df  # keep it for the next section
     st.write(f"Rows: {len(df):,} • Columns: {list(df.columns)}")
 
+    # Let the user choose the text column
     default_col = "complaint_summary" if "complaint_summary" in df.columns else df.columns[0]
-    text_col = st.selectbox(
-        "Which column contains the complaint text?",
-        options=list(df.columns),
-        index=list(df.columns).index(default_col)
-    )
+    text_col = st.selectbox("Which column contains the complaint text?",
+                            options=list(df.columns),
+                            index=list(df.columns).index(default_col))
     st.session_state["text_col"] = text_col
 
+    # Preview
     work = df.copy()
     work["row_id"] = range(len(work))
     missing = work[text_col].isna().sum()
     st.info(f"Selected text column: **{text_col}** • Missing values: **{missing}**")
-
     st.subheader("Preview (first 10 rows)")
     st.dataframe(work[["row_id", text_col]].head(10), use_container_width=True)
 else:
     st.caption("Upload a CSV or Excel file to continue.")
 
-# ---------------- Batch run & export (with retries + fallback) ----------------
+# ---------- Batch run & export (5 retries, then summarize→extract on 6th) ----------
 st.header("Batch extraction — run & export")
 
 df = st.session_state.get("df")
@@ -1580,7 +1580,7 @@ else:
         work = df.copy()
         work["row_id"] = range(len(work))
         col_series = work[text_col].astype(str)
-        valid = col_series.strip().ne("")
+        valid = col_series.str.strip().ne("")
         if skip_no_complaint:
             valid &= col_series.str.strip().str.lower().ne("no complaint")
 
@@ -1606,10 +1606,12 @@ else:
                     break
                 except Exception:
                     attempts += 1
+
                     # attempts 1–5: retry primary with backoff
                     if attempts < 6:
                         time.sleep(min(2 ** attempts, 10))
                         continue
+
                     # attempt 6: summarize → extract once
                     try:
                         sm = call_gemini_summarize(txt)
@@ -1636,10 +1638,6 @@ else:
         st.subheader("Sample of results")
         st.dataframe(out_df.head(20), use_container_width=True)
 
-        # 👉 Join back to the source & store for later interactive sections
-        labeled_df = work.merge(out_df, on="row_id", how="left")
-        st.session_state["themes_labeled_df"] = labeled_df.copy()
-
         # Export only the two arrays (plus row_id) as requested
         csv_bytes = out_df[["row_id", "all_case_themes", "subcategory_themes"]].to_csv(index=False).encode("utf-8")
         st.download_button(
@@ -1648,5 +1646,660 @@ else:
             file_name="themes_subcategories.csv",
             mime="text/csv"
         )
-
         st.info(f"Export ready. Source rows: {len(work)} • Labeled rows: {len(out_df)} (ordered by row_id).")
+
+# ==============================================
+# Bulk JSON export — Clients & Maids
+# ==============================================
+import json
+import hashlib
+from datetime import datetime
+from collections import Counter
+import streamlit as st
+import pandas as pd
+import re
+
+st.markdown("---")
+st.header("Bulk JSON export — Clients & Maids")
+
+# Reuse a source DF from session (scored → engineered → deduped)
+df_scored     = st.session_state.get("scored_df")
+df_engineered = st.session_state.get("engineered_df")
+df_deduped    = st.session_state.get("deduped_df")
+df_source = next((d for d in [df_scored, df_engineered, df_deduped] if isinstance(d, pd.DataFrame)), None)
+
+if df_source is None or df_source.empty:
+    st.info("Load and clean data first (Cleaning → Engineering). Then come back to export JSON.")
+    st.stop()
+
+required_cols = {"client_name", "maid_id", "complaint_summary", "complaint_comments", "tag_date"}
+missing = required_cols - set(df_source.columns)
+if missing:
+    st.error(f"These columns are required: {sorted(missing)}")
+    st.stop()
+
+# ---------- options ----------
+c1, c2, c3 = st.columns([1,1,1])
+with c1:
+    skip_no_complaint = st.checkbox("Skip 'no complaint' rows", value=True)
+with c2:
+    max_rows_per_entity = st.number_input("Max rows per entity (0 = all)", min_value=0, value=0, step=50)
+with c3:
+    show_preview = st.checkbox("Show sample rows in app", value=True)
+
+# Use the same prompt from your Gemini tester
+system_prompt_bulk = st.session_state.get("system_prompt", "")
+if not (system_prompt_bulk or "").strip():
+    st.warning("Paste the System instruction in the Gemini test box above so we can use it here.")
+    st.stop()
+
+def _sha1(s: str) -> str:
+    return hashlib.sha1((s or "").encode("utf-8")).hexdigest()
+
+def _coerce_list(x):
+    """Tolerate list / JSON string / comma or semicolon separated string."""
+    if x is None:
+        return []
+    if isinstance(x, list):
+        return [str(t).strip() for t in x if str(t).strip()]
+    s = str(x).strip()
+    if not s:
+        return []
+    if s.startswith("[") and s.endswith("]"):
+        try:
+            arr = json.loads(s)
+            if isinstance(arr, list):
+                return [str(t).strip() for t in arr if str(t).strip()]
+        except Exception:
+            pass
+    parts = re.split(r"[;,|]+", s)
+    return [p.strip() for p in parts if p.strip()]
+
+@st.cache_data(show_spinner=False, ttl=60*60*24)
+def extract_full_cached(system_prompt: str, complaint_text: str):
+    """
+    Normalized extractor for JSON export:
+    returns {"themes": [...], "subcategories": [...], "evidence_spans": [{"quote": "..."}]}
+    Uses your call_gemini_extract; falls back to call_gemini_summarize if available.
+    """
+    txt = (complaint_text or "").strip()
+    if not txt or txt.lower() == "no complaint":
+        return {"themes": [], "subcategories": [], "evidence_spans": []}
+
+    try:
+        out, _ = call_gemini_extract(system_prompt, txt)
+    except Exception:
+        # optional summarize→extract
+        summarize_fn = globals().get("call_gemini_summarize", None)
+        if callable(summarize_fn):
+            try:
+                sm = summarize_fn(txt) or txt
+                out, _ = call_gemini_extract(system_prompt, sm)
+            except Exception:
+                out = {"all_case_themes": [], "subcategory_themes": [], "evidence_spans": []}
+        else:
+            out = {"all_case_themes": [], "subcategory_themes": [], "evidence_spans": []}
+
+    themes  = _coerce_list(out.get("all_case_themes"))
+    subs    = _coerce_list(out.get("subcategory_themes"))
+    spans   = out.get("evidence_spans") or []
+    norm_spans = []
+    for s in spans:
+        if isinstance(s, dict) and "quote" in s:
+            norm_spans.append({"quote": str(s["quote"])})
+        elif isinstance(s, str):
+            norm_spans.append({"quote": s})
+    return {"themes": themes, "subcategories": subs, "evidence_spans": norm_spans}
+
+def _filter_df(df: pd.DataFrame) -> pd.DataFrame:
+    s = df.copy()
+
+    # Clean text columns robustly
+    s["complaint_summary"]  = (
+        s["complaint_summary"].fillna("").astype(str).str.strip()
+    )
+    s["complaint_comments"] = (
+        s["complaint_comments"].fillna("").astype(str).str.strip()
+    )
+
+    # Keep only rows with non-empty summaries (and optionally skip "no complaint")
+    mask = s["complaint_summary"].ne("")
+    if skip_no_complaint:
+        mask &= s["complaint_summary"].str.lower().ne("no complaint")
+
+    return s.loc[mask]
+
+def _build_json(df: pd.DataFrame, group_col: str, prompt: str, max_rows: int = 0, progress_label: str = ""):
+    df = _filter_df(df)
+    groups = df.groupby(group_col, dropna=False)
+    total_groups = groups.ngroups
+    prog = st.progress(0.0) if progress_label else None
+
+    items = []
+    total_rows = 0
+
+    for gi, (gkey, sub) in enumerate(groups, start=1):
+        sub = sub.sort_values(by="tag_date", na_position="last")
+        if max_rows:
+            sub = sub.head(int(max_rows))
+
+        entry_rows = []
+        t_counter = Counter()
+        s_counter = Counter()
+
+        for _, r in sub.iterrows():
+            ext = extract_full_cached(prompt, r["complaint_summary"])
+            themes = ext["themes"]; subs = ext["subcategories"]; spans = ext["evidence_spans"]
+            t_counter.update(themes)
+            s_counter.update(subs)
+
+            entry_rows.append({
+                group_col: gkey,
+                "client_name": r.get("client_name"),
+                "maid_id":     r.get("maid_id"),
+                "tag_date":    str(r.get("tag_date", "")),
+                "complaint_summary":  r.get("complaint_summary", ""),
+                "complaint_comments": r.get("complaint_comments", ""),
+                "themes": themes,
+                "subcategories": subs,
+                "evidence_spans": spans,
+            })
+
+        total_rows += len(entry_rows)
+        items.append({
+            group_col: gkey,
+            "count_rows": len(entry_rows),
+            "top_themes": [{"theme": k, "count": v} for k, v in t_counter.most_common(20)],
+            "top_subcategories": [{"subcategory": k, "count": v} for k, v in s_counter.most_common(20)],
+            "rows": entry_rows,
+        })
+
+        if prog:
+            prog.progress(gi / total_groups)
+
+    payload = {
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "model": st.secrets.get("MODEL_NAME", "gemini-2.5-flash-lite"),
+        "system_prompt_sha1": _sha1(prompt),
+        "group_by": group_col,
+        "total_entities": len(items),
+        "total_rows": total_rows,
+        "items": items,
+    }
+    return payload
+
+tab_clients, tab_maids = st.tabs(["📁 Export by Client", "🧑‍🍳 Export by Maid"])
+
+with tab_clients:
+    st.caption("Build a JSON file with all complaints grouped by client.")
+    # Optional subset
+    client_list = sorted(df_source["client_name"].dropna().astype(str).unique().tolist())
+    sel_clients = st.multiselect("Limit to specific clients (optional)", client_list, default=[])
+    df_work = df_source if not sel_clients else df_source[df_source["client_name"].astype(str).isin(sel_clients)]
+
+    if st.button("Build JSON (clients)"):
+        payload = _build_json(df_work, "client_name", system_prompt_bulk, max_rows_per_entity, "clients")
+        # Quick preview
+        if show_preview and payload["items"]:
+            st.subheader("Preview")
+            preview_rows = []
+            for it in payload["items"][:2]:  # first 2 clients
+                preview_rows.extend(it["rows"][:2])  # first 2 rows each
+            st.dataframe(pd.DataFrame(preview_rows), use_container_width=True)
+        # Download
+        bytes_out = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        st.download_button("⬇️ Download complaints_by_clients.json", data=bytes_out,
+                           file_name="complaints_by_clients.json", mime="application/json")
+        st.success(f"Built {payload['total_entities']} clients • {payload['total_rows']} rows.")
+
+with tab_maids:
+    st.caption("Build a JSON file with all complaints grouped by maid.")
+    maid_list = sorted(df_source["maid_id"].dropna().astype(str).unique().tolist())
+    sel_maids = st.multiselect("Limit to specific maids (optional)", maid_list, default=[])
+    df_work2 = df_source if not sel_maids else df_source[df_source["maid_id"].astype(str).isin(sel_maids)]
+
+    if st.button("Build JSON (maids)"):
+        payload2 = _build_json(df_work2, "maid_id", system_prompt_bulk, max_rows_per_entity, "maids")
+        # Quick preview
+        if show_preview and payload2["items"]:
+            st.subheader("Preview")
+            preview_rows2 = []
+            for it in payload2["items"][:2]:  # first 2 maids
+                preview_rows2.extend(it["rows"][:2])  # first 2 rows each
+            st.dataframe(pd.DataFrame(preview_rows2), use_container_width=True)
+        # Download
+        bytes_out2 = json.dumps(payload2, ensure_ascii=False, indent=2).encode("utf-8")
+        st.download_button("⬇️ Download complaints_by_maids.json", data=bytes_out2,
+                           file_name="complaints_by_maids.json", mime="application/json")
+        st.success(f"Built {payload2['total_entities']} maids • {payload2['total_rows']} rows.")
+
+
+
+
+
+# ==============================================
+# Step 5 — Auto Assignment (Themes + Matching Score)
+# ==============================================
+import json
+import math
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+st.markdown("---")
+st.header("Auto-Assignment (Themes ✕ Matching Score)")
+
+# ---------- 0) Pull a source DF ----------
+df_scored     = st.session_state.get("scored_df")
+df_engineered = st.session_state.get("engineered_df")
+df_source = None
+
+if isinstance(df_scored, pd.DataFrame) and not df_scored.empty:
+    df_source = df_scored.copy()
+elif isinstance(df_engineered, pd.DataFrame) and not df_engineered.empty:
+    # compute scores if needed
+    with st.spinner("Scoring (balanced policy)…"):
+        df_source = apply_matching_score(df_engineered.copy(), policy="balanced")
+else:
+    st.warning("Please run Cleaning → Feature Engineering first (and Scoring if you want a custom policy).")
+    st.stop()
+
+# Ensure basic identifiers exist and are strings
+for col in ["client_name", "maid_id"]:
+    if col not in df_source.columns:
+        st.error(f"Missing column in dataset: {col}")
+        st.stop()
+df_source["client_name"] = df_source["client_name"].astype(str)
+df_source["maid_id"]     = df_source["maid_id"].astype(str)
+
+# ---------- 1) Optional: upload themes JSON produced by your Bulk JSON export ----------
+st.subheader("Themes inputs (optional)")
+c1, c2 = st.columns(2)
+with c1:
+    client_json_file = st.file_uploader("Client themes JSON", type=["json"], key="client_themes_json_up")
+with c2:
+    maid_json_file = st.file_uploader("Maid themes JSON", type=["json"], key="maid_themes_json_up")
+
+def _load_theme_map(file, entity_key: str) -> dict[str, dict[str, int]]:
+    """
+    Robustly load your themes JSON and return:
+        { <entity_id>: { <theme>: frequency, ... }, ... }
+
+    Accepts shapes:
+      1) { "<id>": [ {all_case_themes:[], subcategory_themes:[]}, ... ], ... }
+      2) { "clients" | "maids" | "entities": [...] }  (unwraps)
+      3) [ {client_name/maid_id: "...", all_case_themes:[], subcategory_themes:[]}, ... ]
+      4) rows using keys 'themes'/'subcats'/'subcategories' instead of 'all_case_themes'/'subcategory_themes'
+    """
+    if not file:
+        return {}
+
+    import json
+    file.seek(0)
+    raw = json.loads(file.read().decode("utf-8"))
+
+    # ---- unify into a mapping: id -> list_of_rows ----
+    mapping = None
+
+    if isinstance(raw, dict):
+        # unwrap common wrappers
+        if "clients" in raw and isinstance(raw["clients"], (dict, list)):
+            mapping = raw["clients"]
+        elif "maids" in raw and isinstance(raw["maids"], (dict, list)):
+            mapping = raw["maids"]
+        elif "entities" in raw and isinstance(raw["entities"], list):
+            # e.g. {"entities":[{"id": "...", "rows":[...]}, ...]}
+            mapping = {}
+            for e in raw["entities"]:
+                if not isinstance(e, dict):
+                    continue
+                k = str(
+                    e.get("id")
+                    or e.get(entity_key)
+                    or e.get("client_name")
+                    or e.get("maid_id")
+                    or ""
+                )
+                if not k:
+                    continue
+                rows = e.get("rows") or e.get("items") or e.get("complaints") or []
+                if isinstance(rows, dict):
+                    rows = [rows]
+                if not isinstance(rows, list):
+                    rows = []
+                mapping[k] = rows
+        else:
+            # Could already be {id: [rows], ...}
+            # Or {id: {single_row}}, normalize single_row -> [single_row]
+            ok = True
+            for v in raw.values():
+                if not isinstance(v, (list, dict, type(None))):
+                    ok = False
+                    break
+            if ok:
+                mapping = {}
+                for k, v in raw.items():
+                    if v is None:
+                        rows = []
+                    elif isinstance(v, dict):
+                        rows = [v]
+                    elif isinstance(v, list):
+                        rows = v
+                    else:
+                        rows = []
+                    mapping[str(k)] = rows
+
+    if mapping is None and isinstance(raw, list):
+        # list of row objects → group by entity_key
+        mapping = {}
+        for r in raw:
+            if not isinstance(r, dict):
+                continue
+            k = str(
+                r.get(entity_key)
+                or r.get("id")
+                or r.get("client_name")
+                or r.get("maid_id")
+                or ""
+            )
+            if not k:
+                continue
+            mapping.setdefault(k, []).append(r)
+
+    if mapping is None:
+        # Unknown shape → treat as empty
+        return {}
+
+    # ---- collapse to id -> Counter(theme) ----
+    theme_map: dict[str, dict[str, int]] = {}
+    for ent_id, rows in mapping.items():
+        # sanitize rows
+        if rows is None:
+            rows = []
+        if isinstance(rows, dict):
+            rows = [rows]
+        if not isinstance(rows, list):
+            rows = []
+
+        counter: dict[str, int] = {}
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+
+            # accept both naming conventions
+            all_themes = []
+            for key in ("all_case_themes", "themes", "all_themes"):
+                v = r.get(key)
+                if isinstance(v, list):
+                    all_themes.extend(v)
+            for key in ("subcategory_themes", "subcats", "subcategories"):
+                v = r.get(key)
+                if isinstance(v, list):
+                    all_themes.extend(v)
+
+            for t in all_themes:
+                t = str(t).strip().lower()
+                if not t:
+                    continue
+                counter[t] = counter.get(t, 0) + 1
+
+        theme_map[str(ent_id)] = counter
+
+    return theme_map
+client_theme_map = _load_theme_map(client_json_file, "client_name")
+maid_theme_map   = _load_theme_map(maid_json_file, "maid_id")
+
+# Small helper to show what we loaded
+def _spark_terms(d, n=8):
+    terms = sorted(d.items(), key=lambda kv: (-kv[1], kv[0]))[:n]
+    return ", ".join([f"{k}×{v}" for k,v in terms]) if terms else "—"
+
+if client_theme_map or maid_theme_map:
+    st.info(f"Loaded themes — clients: {len(client_theme_map)}; maids: {len(maid_theme_map)}")
+
+# ---------- 2) Controls ----------
+st.subheader("Scoring mix & constraints")
+colA, colB, colC, colD = st.columns([1,1,1,1])
+with colA:
+    base_weight = st.slider("Weight: model score (0–1)", 0.0, 1.0, 1.0, 0.05)
+with colB:
+    overlap_penalty = st.slider("Penalty per overlapping theme", -40, 0, -8, 1)
+with colC:
+    penalty_cap = st.slider("Cap: total theme penalty", -100, 0, -30, 1)
+with colD:
+    max_pairs = st.number_input("Max clients to assign (0=all)", min_value=0, value=0, step=10)
+
+# Optional: keep only the latest tag_date per (client, maid) if duplicates
+df_work = df_source.copy()
+if "tag_date" in df_work.columns:
+    df_work["tag_date"] = pd.to_datetime(df_work["tag_date"], errors="coerce")
+    df_work.sort_values(["client_name","maid_id","tag_date"], ascending=[True,True,False], inplace=True)
+    df_work = df_work.drop_duplicates(subset=["client_name","maid_id"], keep="first")
+
+# Pick populations
+clients = sorted(df_work["client_name"].unique().tolist())
+maids   = sorted(df_work["maid_id"].unique().tolist())
+
+# Optional filter by cc_type to keep apples-to-apples
+same_cc = st.checkbox("Only match clients ⇄ maids within the same cc_type group (if present)", value=False)
+if same_cc and "cc_type" in df_work.columns:
+    # Ensure each maid seen with one cc_type; if not, we won't filter by it
+    pass
+
+# ---------- 3) Build theme-based compatibility adjustment ----------
+def theme_adjustment(client_id: str, maid_id: str) -> tuple[int, list]:
+    """
+    Negative penalty for overlapping 'risk' themes:
+      - what this client has complained about historically
+      - what others have complained about this maid
+    Returns (penalty_int, list_of_overlaps)
+    """
+    cbag = client_theme_map.get(client_id, {})
+    mbag = maid_theme_map.get(maid_id, {})
+    if not cbag or not mbag:
+        return 0, []
+
+    overlaps = sorted(set(cbag.keys()) & set(mbag.keys()))
+    if not overlaps:
+        return 0, []
+    # simple penalty: count overlaps, weighted very lightly by sum of freq (bounded)
+    raw_pen = 0
+    for t in overlaps:
+        raw_pen += 1  # one unit per overlapping theme
+    pen = int(np.clip(raw_pen * overlap_penalty, penalty_cap, 0))
+    return pen, overlaps
+
+# ---------- 4) Compose composite score per candidate pair ----------
+# Build small lookup of base model score & score_notes per (client, maid)
+# If you computed scores on each row (client—maid), we’ll use that. If missing, we recompute.
+if "match_score" not in df_work.columns or "decision" not in df_work.columns or "score_notes" not in df_work.columns:
+    with st.spinner("Scoring (balanced policy)…"):
+        df_work = apply_matching_score(df_work, policy="balanced")
+
+row_lookup = {}
+for _, r in df_work.iterrows():
+    key = (str(r["client_name"]), str(r["maid_id"]))
+    row_lookup[key] = {
+        "base": float(r.get("match_score", 0.0) or 0.0),
+        "notes": str(r.get("score_notes", "") or ""),
+        "decision": str(r.get("decision", "") or ""),
+    }
+
+# “Matching types” helpers
+client_cols = [c for c in df_work.columns if c.startswith("clientmts_")]
+maid_cols_mts   = [c for c in df_work.columns if c.startswith("maidmts_")]
+maid_cols_pref  = [c for c in df_work.columns if c.startswith("maidpref_")]
+
+def _types_row(client_id: str, maid_id: str) -> dict:
+    # Grab any row for this client-maid to display engineered types
+    row = df_work[(df_work["client_name"]==client_id) & (df_work["maid_id"]==maid_id)]
+    if row.empty:
+        return {"client": {}, "maid": {}}
+    r = row.iloc[0]
+    client_types = {c: r[c] for c in client_cols if pd.notna(r.get(c))}
+    maid_types   = {c: r[c] for c in (maid_cols_mts + maid_cols_pref) if pd.notna(r.get(c))}
+    return {"client": client_types, "maid": maid_types}
+
+# ---------- 5) Build the score matrix ----------
+clients_use = clients[:]
+maids_use   = maids[:]
+if max_pairs and max_pairs > 0:
+    clients_use = clients_use[:max_pairs]
+    maids_use   = maids_use[:max_pairs] if len(maids_use) >= max_pairs else maids_use
+
+nC, nM = len(clients_use), len(maids_use)
+if nC == 0 or nM == 0:
+    st.warning("Not enough clients or maids to build an assignment.")
+    st.stop()
+
+# Create matrix of composite scores; fill with very low scores for missing combos
+S = np.zeros((nC, nM), dtype=float)
+meta = [[None for _ in range(nM)] for __ in range(nC)]  # keep reasons & types
+
+for i, cid in enumerate(clients_use):
+    for j, mid in enumerate(maids_use):
+        base = row_lookup.get((cid, mid), {"base": 0.0, "notes": "", "decision": ""})
+        base_score = base["base"]
+        # Theme penalty
+        t_pen, t_overlap = theme_adjustment(cid, mid)
+        composite = base_weight * base_score + (t_pen)  # t_pen is negative or zero
+
+        S[i, j] = composite
+        meta[i][j] = {
+            "client": cid, "maid": mid,
+            "base": base_score, "composite": composite,
+            "theme_pen": t_pen, "overlaps": t_overlap,
+            "notes": base["notes"], "decision": base["decision"],
+            "types": _types_row(cid, mid),
+        }
+
+# ---------- 6) Solve assignment (maximize S) ----------
+assign_info = []
+try:
+    # Hungarian solves min-cost; convert by negating
+    from scipy.optimize import linear_sum_assignment
+    cost = -S
+    ri, cj = linear_sum_assignment(cost)
+    for i, j in zip(ri, cj):
+        assign_info.append(meta[i][j])
+except Exception:
+    # Fallback: greedy (still reasonable for small sets)
+    st.warning("SciPy not available — using greedy assignment fallback.")
+    seenC, seenM = set(), set()
+    # rank all pairs by composite desc
+    pairs = []
+    for i in range(nC):
+        for j in range(nM):
+            pairs.append((S[i, j], i, j))
+    pairs.sort(reverse=True, key=lambda x: x[0])
+    for score, i, j in pairs:
+        if i in seenC or j in seenM:
+            continue
+        seenC.add(i); seenM.add(j)
+        assign_info.append(meta[i][j])
+        if len(seenC) >= min(nC, nM):
+            break
+
+# ---------- 7) Display results ----------
+def _pill(text, bg="#263238"):
+    return f'<span style="padding:3px 8px;border-radius:12px;background:{bg};color:#fff;font-size:12px;margin-right:6px">{text}</span>'
+
+st.subheader("Suggested assignments (optimal set)")
+rows_for_df = []
+for a in assign_info:
+    overlaps = ", ".join(a["overlaps"]) if a["overlaps"] else "—"
+    # concise reasons: keep the core ‘score_notes’ and theme blurb
+    reason_bits = []
+    if a["notes"]:
+        reason_bits.append(a["notes"])
+    if a["overlaps"]:
+        reason_bits.append(f"Theme risk overlap: {overlaps}")
+    reason = " | ".join(reason_bits)
+
+    # matching types (short)
+    ct = a["types"]["client"]; mt = a["types"]["maid"]
+    ct_show = ", ".join([f"{k.replace('clientmts_','')}: {v}" for k,v in ct.items() if isinstance(v,str) and v not in ("none","unspecified","not_specified")])
+    mt_show = ", ".join([f"{k.replace('maidmts_','').replace('maidpref_','')}: {v}" for k,v in mt.items() if isinstance(v,str) and v not in ("none","unspecified","not_specified")])
+
+    rows_for_df.append({
+        "client_name": a["client"],
+        "maid_id": a["maid"],
+        "composite_score": round(a["composite"], 1),
+        "model_score": round(a["base"], 1),
+        "theme_penalty": a["theme_pen"],
+        "decision": a["decision"],
+        "theme_overlap": overlaps,
+        "client_types": ct_show or "—",
+        "maid_types": mt_show or "—",
+        "why_this_is_optimal": reason or "—",
+    })
+
+assign_df = pd.DataFrame(rows_for_df).sort_values("composite_score", ascending=False)
+
+# Color style
+def _color_score(val):
+    if pd.isna(val): return ""
+    # green high, red low
+    v = float(val)
+    if v >= 85:  color = "#2e7d32"
+    elif v >= 70: color = "#388e3c"
+    elif v >= 55: color = "#558b2f"
+    elif v >= 40: color = "#8e24aa"  # mid
+    else:         color = "#c62828"
+    return f"background-color:{color};color:white"
+
+st.dataframe(
+    assign_df.style.applymap(_color_score, subset=["composite_score"]).format(
+        {"composite_score": "{:.1f}", "model_score": "{:.1f}"}
+    ),
+    use_container_width=True,
+    hide_index=True
+)
+
+# Download
+st.download_button(
+    "⬇️ Download assignments CSV",
+    data=assign_df.to_csv(index=False).encode("utf-8"),
+    file_name="optimal_assignments.csv",
+    mime="text/csv"
+)
+
+# ---------- 8) Inspect any pair ad-hoc ----------
+st.subheader("Explain a specific pair")
+cc1, cc2 = st.columns(2)
+with cc1:
+    pick_client = st.selectbox("Client", clients_use, key="explain_client")
+with cc2:
+    pick_maid = st.selectbox("Maid", maids_use, key="explain_maid")
+
+# Find the meta for this pair
+ex = None
+try:
+    i = clients_use.index(pick_client); j = maids_use.index(pick_maid)
+    ex = meta[i][j]
+except Exception:
+    pass
+
+if ex:
+    st.write(
+        f"**Composite**: {ex['composite']:.1f}  "
+        f"• **Model**: {ex['base']:.1f}  "
+        f"• **Theme penalty**: {ex['theme_pen']}  "
+        f"• **Decision**: {ex['decision']}"
+    )
+    if ex["overlaps"]:
+        st.warning("Theme overlaps: " + ", ".join(ex["overlaps"]))
+    else:
+        st.info("No theme risk overlaps detected.")
+
+    cL, cR = st.columns(2)
+    with cL:
+        st.caption("Client matching types")
+        st.json(ex["types"]["client"])
+    with cR:
+        st.caption("Maid matching types")
+        st.json(ex["types"]["maid"])
+
+    if ex["notes"]:
+        st.caption("Model notes (why):")
+        st.write(ex["notes"])
