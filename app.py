@@ -1338,32 +1338,75 @@ else:
             st.markdown("#### Recent pair scores")
             st.dataframe(pd.DataFrame(st.session_state["pair_score_history"]).tail(10), use_container_width=True)
 
+
+
+
+
 # ==============================================
-# Step 4 — Client ↔︎ Maid Themes Explorer
+# Client ↔ Maid Themes Explorer (self-contained)
 # ==============================================
-import hashlib
+import html
+import json
 from collections import Counter
 
-st.markdown("---")
-st.header("Client ↔︎ Maid Themes Explorer")
+import google.generativeai as genai
+import pandas as pd
+import streamlit as st
 
-# --------- pick a source DataFrame from session ---------
-df_scored      = st.session_state.get("scored_df")
-df_engineered  = st.session_state.get("engineered_df")
-df_deduped     = st.session_state.get("deduped_df")
-df_source = next((d for d in [df_scored, df_engineered, df_deduped] if isinstance(d, pd.DataFrame)), None)
+st.markdown("---")
+st.header("Client ↔ Maid Themes Explorer")
+
+# ---------- Local Gemini settings (API key + prompt) ----------
+api_key_choice = st.radio("API key to use", ["primary", "alt"], horizontal=True)
+ACTIVE_API_KEY = (
+    st.secrets["GOOGLE_API_KEY"]
+    if api_key_choice == "primary"
+    else st.secrets.get("ALT_GOOGLE_API_KEY", st.secrets["GOOGLE_API_KEY"])
+)
+MODEL_NAME = st.secrets.get("MODEL_NAME", "gemini-2.5-flash-lite")
+genai.configure(api_key=ACTIVE_API_KEY)
+
+system_prompt_local = st.text_area(
+    "System instruction used for extraction",
+    value=st.session_state.get("system_prompt", ""),
+    height=180,
+    help="Paste the exact instruction you used to extract themes/subcategories."
+)
+col_save, col_clear = st.columns([1,1])
+with col_save:
+    if st.button("Save prompt for this session"):
+        st.session_state["system_prompt"] = system_prompt_local.strip()
+        st.success("Saved. The extractor below will use this prompt.")
+with col_clear:
+    if st.button("Clear saved prompt"):
+        st.session_state.pop("system_prompt", None)
+        st.info("Cleared.")
+
+ACTIVE_PROMPT = (system_prompt_local or st.session_state.get("system_prompt", "")).strip()
+
+# ---------- Prefer a source DataFrame from session ----------
+df_scored     = st.session_state.get("scored_df")
+df_engineered = st.session_state.get("engineered_df")
+df_deduped    = st.session_state.get("deduped_df")
+# (optionally fall back to uploaded file stored as st.session_state["df"])
+df_uploaded   = st.session_state.get("df")
+
+df_source = next(
+    (d for d in [df_scored, df_engineered, df_deduped, df_uploaded] if isinstance(d, pd.DataFrame)),
+    None
+)
 
 if df_source is None or df_source.empty:
-    st.info("Load and clean data first (Cleaning → Engineering). Then come back to explore themes.")
+    st.info("No data available. Run Cleaning/Engineering first (or upload a file in the Batch section).")
     st.stop()
 
-required_cols = {"client_name","maid_id","complaint_summary","complaint_comments"}
+required_cols = {"client_name", "maid_id", "complaint_summary", "complaint_comments"}
 missing = required_cols - set(df_source.columns)
 if missing:
-    st.error(f"These columns are required in your dataset for this explorer: {sorted(missing)}")
+    st.error(f"Missing required columns for this explorer: {sorted(missing)}")
     st.stop()
 
-# --------- UI: selectors ---------
+# ---------- Select client & maid ----------
 clients = sorted(df_source["client_name"].dropna().astype(str).unique().tolist())
 maids   = sorted(df_source["maid_id"].dropna().astype(str).unique().tolist())
 
@@ -1375,44 +1418,118 @@ with c2:
 with c3:
     max_rows_each = st.number_input("Max rows / section", min_value=1, value=50, step=10)
 
-# --------- helpers ---------
+# ---------- Helpers ----------
 def _chip(text, kind="theme"):
-    bg = {"theme":"#3949ab", "sub":"#00897b", "warn":"#ef6c00"}.get(kind, "#546e7a")
-    return f"""<span style="display:inline-block;margin:2px 6px 2px 0;
-    padding:4px 8px;border-radius:12px;background:{bg};color:white;
-    font-size:12px;white-space:nowrap;">{text}</span>"""
+    palette = {"theme": "#3949ab", "sub": "#00897b", "warn": "#ef6c00"}
+    bg = palette.get(kind, "#546e7a")
+    return (
+        f'<span style="display:inline-block;margin:2px 6px 2px 0;'
+        f'padding:4px 8px;border-radius:12px;background:{bg};color:white;'
+        f'font-size:12px;white-space:nowrap;">{html.escape(str(text))}</span>'
+    )
 
-@st.cache_data(show_spinner=False, ttl=60*60*24)
-def _hash_key(s: str) -> str:
-    return hashlib.sha1(s.encode("utf-8")).hexdigest()
+# Use your global extractors if present; otherwise define minimal local ones
+def _parse_resp(resp):
+    raw_text = getattr(resp, "text", None)
+    if not raw_text and getattr(resp, "candidates", None):
+        parts = resp.candidates[0].content.parts
+        raw_text = "".join(getattr(p, "text", "") for p in parts)
+    return raw_text or ""
+
+try:
+    _ = call_gemini_extract  # type: ignore
+    _HAS_EXTERNAL_EXTRACT = True
+except Exception:
+    _HAS_EXTERNAL_EXTRACT = False
+
+if not _HAS_EXTERNAL_EXTRACT:
+    def call_gemini_extract(system_instruction: str, complaint_text: str):
+        model = genai.GenerativeModel(
+            model_name=MODEL_NAME,
+            system_instruction=system_instruction or ""
+        )
+        generation_config = {
+            "response_mime_type": "application/json",
+            "response_schema": {
+                "type": "object",
+                "properties": {
+                    "all_case_themes":    {"type": "array", "items": {"type": "string"}},
+                    "subcategory_themes": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["all_case_themes","subcategory_themes"]
+            },
+            "max_output_tokens": 512,
+            "temperature": 0.2,
+        }
+        resp = model.generate_content(
+            [{"role": "user", "parts": [f'complaint_summary: """{complaint_text}"""']}],
+            generation_config=generation_config,
+        )
+        raw = _parse_resp(resp)
+        data = json.loads(raw or "{}")
+        return {
+            "all_case_themes": data.get("all_case_themes", []) or [],
+            "subcategory_themes": data.get("subcategory_themes", []) or []
+        }, raw
+
+try:
+    _ = call_gemini_summarize  # type: ignore
+    _HAS_EXTERNAL_SUM = True
+except Exception:
+    _HAS_EXTERNAL_SUM = False
+
+if not _HAS_EXTERNAL_SUM:
+    def call_gemini_summarize(complaint_text: str) -> str:
+        model = genai.GenerativeModel(model_name=MODEL_NAME)
+        generation_config = {
+            "response_mime_type": "application/json",
+            "response_schema": {
+                "type": "object",
+                "properties": {"summary": {"type": "string"}},
+                "required": ["summary"]
+            },
+            "max_output_tokens": 200,
+            "temperature": 0.2,
+        }
+        instruction = (
+            "Summarize this complaint into 3–5 compact bullets (one short paragraph OK) "
+            "containing only substantive issues/behaviors. Remove admin/process details."
+        )
+        resp = model.generate_content(
+            [{"role": "user", "parts": [instruction + f'\n\ntext: """{complaint_text}"""']}],
+            generation_config=generation_config,
+        )
+        raw = _parse_resp(resp)
+        data = json.loads(raw or "{}")
+        return data.get("summary", "").strip()
 
 @st.cache_data(show_spinner=False, ttl=60*60*24)
 def extract_themes_cached(system_prompt: str, text: str):
-    """
-    Cached wrapper around your Gemini extractor, with summarize fallback.
-    Keyed by (prompt_hash, text_hash) so repeated runs are free.
-    """
-    key = _hash_key((system_prompt or "").strip() + "||" + (text or ""))
-    # Invoke Gemini (re-using your functions)
+    """Cache by args; uses summarize→extract fallback when needed."""
     try:
-        out, _ = call_gemini_extract(system_prompt.strip(), text.strip())
+        out, _ = call_gemini_extract(system_prompt, text)
+        themes = [str(t).strip() for t in (out.get("all_case_themes") or []) if str(t).strip()]
+        subs   = [str(t).strip() for t in (out.get("subcategory_themes") or []) if str(t).strip()]
+        return {"themes": themes, "subcats": subs}
     except Exception:
-        # summarize → extract fallback
-        sm = call_gemini_summarize(text.strip())
-        out, _ = call_gemini_extract(system_prompt.strip(), sm or text.strip())
-    # Normalize to lists of strings
-    themes = [str(t).strip() for t in (out.get("all_case_themes") or []) if str(t).strip()]
-    subcats = [str(t).strip() for t in (out.get("subcategory_themes") or []) if str(t).strip()]
-    return {"themes": themes, "subcats": subcats, "cache_key": key}
+        sm = call_gemini_summarize(text)
+        out2, _ = call_gemini_extract(system_prompt, sm or text)
+        themes = [str(t).strip() for t in (out2.get("all_case_themes") or []) if str(t).strip()]
+        subs   = [str(t).strip() for t in (out2.get("subcategory_themes") or []) if str(t).strip()]
+        return {"themes": themes, "subcats": subs}
 
 def _prep_subset(df: pd.DataFrame):
     s = df.copy()
     s["complaint_summary"]  = s["complaint_summary"].astype(str).str.strip()
     s["complaint_comments"] = s["complaint_comments"].astype(str).str.strip()
-    mask = s["complaint_summary"].str.lower().ne("no complaint") & s["complaint_summary"].ne("")
+    mask = s["complaint_summary"].str.len().gt(0) & s["complaint_summary"].str.lower().ne("no complaint")
+    # sort newest first when tag_date exists
+    if "tag_date" in s.columns:
+        s["tag_date_str"] = pd.to_datetime(s["tag_date"], errors="coerce")
+        s = s.sort_values("tag_date_str", ascending=False)
     return s.loc[mask].head(int(max_rows_each))
 
-def _summarize_theme_counts(rows):
+def _summarize_counts(rows):
     theme_counter = Counter()
     sub_counter   = Counter()
     for r in rows:
@@ -1422,21 +1539,20 @@ def _summarize_theme_counts(rows):
     top_subs   = pd.DataFrame(sub_counter.most_common(20), columns=["subcategory","count"])
     return top_themes, top_subs
 
-def _render_rows(df_subset, section_title):
+def _render_rows(df_subset, section_title, system_prompt: str):
     st.subheader(section_title)
     if df_subset.empty:
         st.info("No complaint text to analyze in this section.")
         return pd.DataFrame()
 
-    system_prompt = st.session_state.get("system_prompt", "").strip()
     if not system_prompt:
-        st.warning("Paste your System instruction in the Gemini test box (top of page).")
+        st.warning("Provide the System instruction above.")
         return pd.DataFrame()
 
     prog = st.progress(0.0)
     themed_rows = []
     for k, (_, row) in enumerate(df_subset.iterrows(), start=1):
-        res = extract_themes_cached(system_prompt, row["complaint_summary"])
+        res = extract_themes_cached(system_prompt, str(row["complaint_summary"]))
         themed_rows.append({
             "client_name": row.get("client_name"),
             "maid_id":     row.get("maid_id"),
@@ -1450,8 +1566,8 @@ def _render_rows(df_subset, section_title):
 
     out_df = pd.DataFrame(themed_rows)
 
-    # Top terms
-    top_themes, top_subs = _summarize_theme_counts(themed_rows)
+    # summaries
+    top_themes, top_subs = _summarize_counts(themed_rows)
     cA, cB = st.columns(2)
     with cA:
         st.caption("Top themes")
@@ -1460,38 +1576,39 @@ def _render_rows(df_subset, section_title):
         st.caption("Top subcategories")
         st.dataframe(top_subs, use_container_width=True, hide_index=True)
 
-    # Pretty rows
+    # pretty cards
     st.caption("Labeled complaints")
-    def _row_html(r):
+    cards_html = []
+    for _, r in out_df.iterrows():
         theme_html = " ".join(_chip(t, "theme") for t in r["themes"])
         sub_html   = " ".join(_chip(t, "sub")   for t in r["subcategories"])
         comments   = r["complaint_comments"] or "—"
-        return f"""
+        cards_html.append(f"""
         <div style="border:1px solid #263238;border-radius:10px;padding:10px;margin-bottom:10px;">
-          <div style="font-weight:600">{r.get('client_name','')} → maid {r.get('maid_id','')}</div>
-          <div style="opacity:.8;font-size:12px;margin-bottom:6px;">{r.get('tag_date','')}</div>
-          <div style="margin:6px 0;"><strong>Summary:</strong> {st.escape_markdown(str(r['complaint_summary']))}</div>
+          <div style="font-weight:600">{html.escape(str(r.get('client_name','')))} → maid {html.escape(str(r.get('maid_id','')))}</div>
+          <div style="opacity:.8;font-size:12px;margin-bottom:6px;">{html.escape(str(r.get('tag_date','') or ''))}</div>
+          <div style="margin:6px 0;"><strong>Summary:</strong> {html.escape(str(r['complaint_summary']))}</div>
           <div style="margin:4px 0;">{theme_html}</div>
           <div style="margin:4px 0;">{sub_html}</div>
-          <div style="margin-top:6px;color:#cfd8dc;"><em>Client comments:</em> {st.escape_markdown(str(comments))}</div>
+          <div style="margin-top:6px;color:#cfd8dc;"><em>Client comments:</em> {html.escape(str(comments))}</div>
         </div>
-        """
+        """)
+    st.markdown("\n".join(cards_html), unsafe_allow_html=True)
 
-    html = "\n".join(_row_html(r) for _, r in out_df.iterrows())
-    st.markdown(html, unsafe_allow_html=True)
-
-    # Export
+    # export CSV
     csv_bytes = out_df.assign(
-        themes=lambda d: d["themes"].apply(lambda x: "; ".join(x)),
-        subcategories=lambda d: d["subcategories"].apply(lambda x: "; ".join(x)),
+        themes=lambda d: d["themes"].apply(lambda xs: "; ".join(xs)),
+        subcategories=lambda d: d["subcategories"].apply(lambda xs: "; ".join(xs)),
     ).to_csv(index=False).encode("utf-8")
     st.download_button(
         f"⬇️ Download {section_title} themes",
-        data=csv_bytes, file_name=f"themes_{section_title.replace(' ','_').lower()}.csv", mime="text/csv"
+        data=csv_bytes,
+        file_name=f"themes_{section_title.replace(' ','_').lower()}.csv",
+        mime="text/csv",
     )
     return out_df
 
-# --------- build the three views ---------
+# ---------- Build the three views ----------
 client_subset = _prep_subset(df_source[df_source["client_name"].astype(str) == str(sel_client)])
 maid_subset   = _prep_subset(df_source[df_source["maid_id"].astype(str) == str(sel_maid)])
 pair_subset   = _prep_subset(
@@ -1500,25 +1617,23 @@ pair_subset   = _prep_subset(
 )
 
 st.write(
-    f"Rows selected — client: **{len(client_subset)}**, maid: **{len(maid_subset)}**, pair: **{len(pair_subset)}** "
-    "(skipping empty or 'no complaint' summaries)."
+    f"Rows selected — client: **{len(client_subset)}**, maid: **{len(maid_subset)}**, "
+    f"pair: **{len(pair_subset)}** (skipping empty or 'no complaint' summaries)."
 )
 
-# Action button
 if st.button("🧩 Extract themes for client, maid, and client→maid"):
     # A) Client history
-    df_client_out = _render_rows(client_subset, "Client history")
+    _render_rows(client_subset, "Client history", ACTIVE_PROMPT)
     # B) Maid history
-    df_maid_out   = _render_rows(maid_subset, "Maid history")
-    # C) Pair intersection (with explicit comments highlight)
+    _render_rows(maid_subset, "Maid history", ACTIVE_PROMPT)
+    # C) Pair intersection
     st.subheader("Client → Maid (intersection)")
     if pair_subset.empty:
         st.info("This client has no complaint entries on the selected maid.")
     else:
-        # Show raw comments consolidated first
         st.caption("Client comments about this maid")
         for _, r in pair_subset.iterrows():
-            cm = r.get("complaint_comments") or ""
+            cm = (r.get("complaint_comments") or "").strip()
             if cm and cm.lower() != "no complaint":
                 st.markdown(f"- {cm}")
-        _render_rows(pair_subset, "Client→Maid")
+        _render_rows(pair_subset, "Client→Maid", ACTIVE_PROMPT)
