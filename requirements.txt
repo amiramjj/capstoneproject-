@@ -5,3 +5,23 @@ numpy>=1.26
 openpyxl>=3.1
 google-generativeai>=0.8.0
 lightgbm>=4.3
+
+streamlit==1.36.0
+pandas==2.2.2
+numpy==1.26.4
+
+# Charts
+plotly==5.22.0
+
+# Excel support
+openpyxl==3.1.2   # .xlsx
+xlrd==2.0.1       # .xls
+
+# Optimal assignment (Hungarian); you used this in Auto-Assignment
+scipy==1.13.1
+
+# Gemini pages you built
+google-generativeai==0.7.2
+
+# (Optional, but nice to have for fast IO; safe to remove if you want minimal)
+pyarrow==16.1.0
