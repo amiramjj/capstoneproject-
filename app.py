@@ -1342,37 +1342,61 @@ else:
 
 
 
-
-
 # ==============================================
-# Client ↔ Maid Themes Explorer (self-contained)
+# Client ↔ Maid Themes Explorer  (self-healing)
 # ==============================================
+import sys, subprocess, importlib, importlib.metadata as md
 import json, html
 from collections import Counter
 
 import pandas as pd
 import streamlit as st
 
-# ---- Try to import Gemini SDK; show a helpful message if missing ----
-try:
-    import google.generativeai as genai
-    _HAS_GENAI = True
-except ModuleNotFoundError:
-    _HAS_GENAI = False
-
 st.markdown("---")
 st.header("Client ↔ Maid Themes Explorer")
 
-if not _HAS_GENAI:
-    st.error(
-        "The Google Gemini SDK (`google-generativeai`) is not installed.\n\n"
-        "Add these to your **requirements.txt** and redeploy:\n"
-        "`google-generativeai>=0.8.0` and `protobuf>=4.25,<5`."
-    )
+# ---------- Ensure dependencies at runtime (temporary self-heal) ----------
+def _ensure_pkg(module_name: str, pip_spec: str):
+    """If `module_name` can't be imported, pip install `pip_spec` and retry."""
+    try:
+        importlib.import_module(module_name)
+        return True, ""
+    except Exception:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--no-cache-dir", pip_spec],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+        )
+        importlib.invalidate_caches()
+        try:
+            importlib.import_module(module_name)
+            return True, proc.stdout
+        except Exception as e:
+            return False, proc.stdout + f"\n\nImport failed: {e}"
+
+# install protobuf first (namespace under `google.protobuf`)
+ok_pb, log_pb = _ensure_pkg("google.protobuf", "protobuf>=4.25,<5")
+# then the Gemini SDK
+ok_gem, log_gem = _ensure_pkg("google.generativeai", "google-generativeai>=0.8.0")
+
+if (not ok_pb) or (not ok_gem):
+    st.error("Could not install required packages automatically.")
+    if not ok_pb:
+        st.code(log_pb[-4000:] or "protobuf install produced no output", language="bash")
+    if not ok_gem:
+        st.code(log_gem[-4000:] or "google-generativeai install produced no output", language="bash")
     st.stop()
 
-# ---------- Local Gemini settings (API key + prompt) ----------
-api_key_choice = st.radio("API key to use", ["primary", "alt"], horizontal=True)
+# Show versions (useful while debugging)
+try:
+    st.caption(f"google-generativeai {md.version('google-generativeai')} • protobuf {md.version('protobuf')}")
+except md.PackageNotFoundError:
+    st.warning("Package metadata not found (but import should still work).")
+
+# ---------- Imports (now safe) ----------
+import google.generativeai as genai  # type: ignore
+
+# ---------- Settings / API keys ----------
+api_key_choice = st.radio("API key to use", ["primary", "alt"], horizontal=True, key="themes_api_key_choice")
 ACTIVE_API_KEY = (
     st.secrets["GOOGLE_API_KEY"]
     if api_key_choice == "primary"
@@ -1385,15 +1409,14 @@ system_prompt_local = st.text_area(
     "System instruction used for extraction",
     value=st.session_state.get("system_prompt", ""),
     height=180,
-    help="Paste the exact instruction you used to extract themes/subcategories."
+    help="Paste the same instruction you used when building the themes prompt."
 )
-
-c_save, c_clear = st.columns([1, 1])
-with c_save:
+save_col, clear_col = st.columns(2)
+with save_col:
     if st.button("Save prompt for this session"):
         st.session_state["system_prompt"] = system_prompt_local.strip()
-        st.success("Saved. The extractor below will use this prompt.")
-with c_clear:
+        st.success("Saved.")
+with clear_col:
     if st.button("Clear saved prompt"):
         st.session_state.pop("system_prompt", None)
         st.info("Cleared.")
@@ -1404,13 +1427,9 @@ ACTIVE_PROMPT = (system_prompt_local or st.session_state.get("system_prompt", ""
 df_scored     = st.session_state.get("scored_df")
 df_engineered = st.session_state.get("engineered_df")
 df_deduped    = st.session_state.get("deduped_df")
-df_uploaded   = st.session_state.get("df")  # optional fallback from Upload page
+df_uploaded   = st.session_state.get("df")  # optional fallback from your upload page
 
-df_source = next(
-    (d for d in [df_scored, df_engineered, df_deduped, df_uploaded] if isinstance(d, pd.DataFrame)),
-    None
-)
-
+df_source = next((d for d in [df_scored, df_engineered, df_deduped, df_uploaded] if isinstance(d, pd.DataFrame)), None)
 if df_source is None or df_source.empty:
     st.info("No data available. Run Cleaning/Engineering (or upload a file in the Batch section).")
     st.stop()
@@ -1450,73 +1469,54 @@ def _parse_resp(resp):
         raw_text = "".join(getattr(p, "text", "") for p in parts)
     return raw_text or ""
 
-# Use your global extractors if present; otherwise define minimal local ones
-try:
-    _ = call_gemini_extract  # defined elsewhere?
-    _HAS_EXTERNAL_EXTRACT = True
-except Exception:
-    _HAS_EXTERNAL_EXTRACT = False
-
-if not _HAS_EXTERNAL_EXTRACT:
-    def call_gemini_extract(system_instruction: str, complaint_text: str):
-        model = genai.GenerativeModel(
-            model_name=MODEL_NAME,
-            system_instruction=system_instruction or ""
-        )
-        generation_config = {
-            "response_mime_type": "application/json",
-            "response_schema": {
-                "type": "object",
-                "properties": {
-                    "all_case_themes":    {"type": "array", "items": {"type": "string"}},
-                    "subcategory_themes": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["all_case_themes", "subcategory_themes"]
+def call_gemini_extract(system_instruction: str, complaint_text: str):
+    model = genai.GenerativeModel(
+        model_name=MODEL_NAME,
+        system_instruction=system_instruction or ""
+    )
+    generation_config = {
+        "response_mime_type": "application/json",
+        "response_schema": {
+            "type": "object",
+            "properties": {
+                "all_case_themes":    {"type": "array", "items": {"type": "string"}},
+                "subcategory_themes": {"type": "array", "items": {"type": "string"}},
             },
-            "max_output_tokens": 512,
-            "temperature": 0.2,
-        }
-        resp = model.generate_content(
-            [{"role": "user", "parts": [f'complaint_summary: """{complaint_text}"""']}],
-            generation_config=generation_config,
-        )
-        raw = _parse_resp(resp)
-        data = json.loads(raw or "{}")
-        return {
-            "all_case_themes": data.get("all_case_themes", []) or [],
-            "subcategory_themes": data.get("subcategory_themes", []) or []
-        }, raw
+            "required": ["all_case_themes", "subcategory_themes"]
+        },
+        "max_output_tokens": 512,
+        "temperature": 0.2,
+    }
+    resp = model.generate_content(
+        [{"role": "user", "parts": [f'complaint_summary: """{complaint_text}"""']}],
+        generation_config=generation_config,
+    )
+    raw = _parse_resp(resp)
+    data = json.loads(raw or "{}")
+    return {
+        "all_case_themes": data.get("all_case_themes", []) or [],
+        "subcategory_themes": data.get("subcategory_themes", []) or []
+    }, raw
 
-try:
-    _ = call_gemini_summarize  # defined elsewhere?
-    _HAS_EXTERNAL_SUM = True
-except Exception:
-    _HAS_EXTERNAL_SUM = False
-
-if not _HAS_EXTERNAL_SUM:
-    def call_gemini_summarize(complaint_text: str) -> str:
-        model = genai.GenerativeModel(model_name=MODEL_NAME)
-        generation_config = {
-            "response_mime_type": "application/json",
-            "response_schema": {
-                "type": "object",
-                "properties": {"summary": {"type": "string"}},
-                "required": ["summary"]
-            },
-            "max_output_tokens": 200,
-            "temperature": 0.2,
-        }
-        instruction = (
-            "Summarize this complaint into 3–5 compact bullets (one short paragraph OK) "
-            "containing only substantive issues/behaviors. Remove admin/process details."
-        )
-        resp = model.generate_content(
-            [{"role": "user", "parts": [instruction + f'\n\ntext: """{complaint_text}"""']}],
-            generation_config=generation_config,
-        )
-        raw = _parse_resp(resp)
-        data = json.loads(raw or "{}")
-        return data.get("summary", "").strip()
+def call_gemini_summarize(complaint_text: str) -> str:
+    model = genai.GenerativeModel(model_name=MODEL_NAME)
+    generation_config = {
+        "response_mime_type": "application/json",
+        "response_schema": {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]},
+        "max_output_tokens": 200,
+        "temperature": 0.2,
+    }
+    instruction = (
+        "Summarize this complaint into 3–5 compact bullets (one short paragraph OK) "
+        "containing only substantive issues/behaviors. Remove admin/process details."
+    )
+    resp = model.generate_content(
+        [{"role": "user", "parts": [instruction + f'\n\ntext: """{complaint_text}"""']}],
+        generation_config=generation_config,
+    )
+    raw = _parse_resp(resp)
+    data = json.loads(raw or "{}")
+    return data.get("summary", "").strip()
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def extract_themes_cached(system_prompt: str, text: str):
